@@ -140,9 +140,14 @@ def main(cfg: DictConfig):
     task_file_cfg = manager.get("task_file")
     if task_file_cfg:
         task_file = Path(os.path.expanduser(os.path.expandvars(str(task_file_cfg))))
+        if not task_file.is_file():
+            raise FileNotFoundError(f"Configured task file does not exist: {task_file}")
+        if task_file.stat().st_size == 0:
+            raise ValueError(f"Configured task file is empty: {task_file}")
+        print(f"Using configured task file without overwriting it: {task_file}")
     else:
         task_file = output_dir / "tasks.txt"
-    task_file = create_task_file(task_file, list(manager.task_suite_names))
+        task_file = create_task_file(task_file, list(manager.task_suite_names))
 
     OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))
 
