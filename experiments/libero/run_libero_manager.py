@@ -1,6 +1,7 @@
 import os
 import shlex
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -91,6 +92,7 @@ def run_evaluation(
             "OUTPUT_DIR": str(output_dir),
             "EXTRA_ARGS": extra_args,
             "EXP_NAME": os.environ.get("EXP_NAME", ""),
+            "PYTHON_BIN": sys.executable,
         }
     )
 
@@ -101,6 +103,7 @@ def run_evaluation(
     print(f"Trials per task: {num_trials}")
     print(f"Max tasks per GPU: {max_tasks_per_gpu}")
     print(f"Output directory: {output_dir}")
+    print(f"Worker Python: {sys.executable}")
     if extra_args:
         print(f"Forwarded overrides: {extra_args}")
 

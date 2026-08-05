@@ -596,6 +596,40 @@ def run_single_task(
     model_device: str,
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    try:
+        return _run_single_task_with_env(
+            env=env,
+            task_description=task_description,
+            initial_states=initial_states,
+            model=model,
+            processor=processor,
+            cfg=cfg,
+            video_dir=video_dir,
+            predicted_video_dir=predicted_video_dir,
+            action_horizon=action_horizon,
+            input_w=input_w,
+            input_h=input_h,
+            model_device=model_device,
+        )
+    finally:
+        env.close()
+
+
+def _run_single_task_with_env(
+    env,
+    task_description: str,
+    initial_states,
+    model: torch.nn.Module,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+    video_dir: Path,
+    predicted_video_dir: Path,
+    *,
+    action_horizon: int,
+    input_w: int,
+    input_h: int,
+    model_device: str,
+) -> dict:
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
