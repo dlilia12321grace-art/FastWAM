@@ -29,6 +29,10 @@ EVALUATION:
   save_rollout_video: true
   profile_timing: false
   analyze_c3cache_residuals: false
+  enable_c3cache: false
+  c3cache_start_step: 0
+  c3cache_end_step: 6
+  c3cache_refresh_interval: 4
 
   # Action inference
   action_horizon: null

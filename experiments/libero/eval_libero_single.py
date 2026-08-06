@@ -421,6 +421,12 @@ def _predict_action_chunk(
         infer_kwargs["analyze_c3cache_residuals"] = bool(
             cfg.EVALUATION.get("analyze_c3cache_residuals", False)
         )
+        infer_kwargs["enable_c3cache"] = bool(cfg.EVALUATION.get("enable_c3cache", False))
+        infer_kwargs["c3cache_start_step"] = int(cfg.EVALUATION.get("c3cache_start_step", 0))
+        infer_kwargs["c3cache_end_step"] = int(cfg.EVALUATION.get("c3cache_end_step", 6))
+        infer_kwargs["c3cache_refresh_interval"] = int(
+            cfg.EVALUATION.get("c3cache_refresh_interval", 4)
+        )
 
     with torch.no_grad():
         if visualize_future_video:
@@ -446,6 +452,11 @@ def _predict_action_chunk(
         if chunk_metrics is None:
             chunk_metrics = {}
         chunk_metrics["c3cache_residual_analysis"] = residual_analysis
+    c3cache_metrics = pred.get("c3cache")
+    if c3cache_metrics is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["c3cache"] = c3cache_metrics
     return action, imgs, predicted_future_frames, chunk_metrics
 
 
@@ -486,6 +497,11 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    if bool(cfg.EVALUATION.get("enable_c3cache", False)):
+        reset_cache = getattr(model, "reset_c3cache_state", None)
+        if reset_cache is None:
+            raise AttributeError("Model does not provide reset_c3cache_state().")
+        reset_cache()
     if bool(cfg.EVALUATION.get("analyze_c3cache_residuals", False)):
         reset_analysis = getattr(model, "reset_c3cache_analysis", None)
         if reset_analysis is None:
@@ -792,6 +808,21 @@ def _run_single_task_with_env(
             float(np.mean(per_step_values[step_idx]))
             for step_idx in sorted(per_step_values)
         ]
+        c3cache_chunks = [
+            chunk["c3cache"]
+            for chunk in all_chunk_timings
+            if "c3cache" in chunk
+        ]
+        if c3cache_chunks:
+            summary["c3cache_full_steps"] = int(
+                sum(int(chunk["full_steps"]) for chunk in c3cache_chunks)
+            )
+            summary["c3cache_cached_steps"] = int(
+                sum(int(chunk["cached_steps"]) for chunk in c3cache_chunks)
+            )
+            summary["c3cache_refresh_chunks"] = int(
+                sum(1 for chunk in c3cache_chunks if bool(chunk["refresh_cache"]))
+            )
         results["timing_profile"]["summary"] = summary
     if analyze_c3cache_residuals:
         similarities_by_step: dict[int, list[float]] = {}

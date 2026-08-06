@@ -86,6 +86,7 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
         self.reset_c3cache_analysis()
+        self.reset_c3cache_state()
 
         self.to(self.device)
 
@@ -93,6 +94,11 @@ class FastWAM(torch.nn.Module):
         """Clear cross-chunk residuals at an episode boundary."""
         self._c3cache_analysis_prev_residuals: dict[int, torch.Tensor] = {}
         self._c3cache_analysis_chunk_index = 0
+
+    def reset_c3cache_state(self) -> None:
+        """Clear C3ache residual cache at an episode boundary."""
+        self._c3cache_residuals: dict[int, torch.Tensor] = {}
+        self._c3cache_chunk_index = 0
 
     @classmethod
     def from_wan22_pretrained(
@@ -737,6 +743,32 @@ class FastWAM(torch.nn.Module):
         return pred_action
 
     @torch.no_grad()
+    def _predict_action_noise_from_cached_residual(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        if action_pre["tokens"].shape != residual.shape:
+            raise ValueError(
+                "C3ache residual shape does not match action tokens: "
+                f"{tuple(residual.shape)} vs {tuple(action_pre['tokens'].shape)}"
+            )
+        action_tokens = action_pre["tokens"] + residual.to(
+            device=action_pre["tokens"].device,
+            dtype=action_pre["tokens"].dtype,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
+    @torch.no_grad()
     def infer_joint(
         self,
         prompt: Optional[str],
@@ -934,6 +966,10 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
         profile_timing: bool = False,
         analyze_c3cache_residuals: bool = False,
+        enable_c3cache: bool = False,
+        c3cache_start_step: int = 0,
+        c3cache_end_step: int = 6,
+        c3cache_refresh_interval: int = 4,
     ) -> dict[str, Any]:
         timing: dict[str, Any] = {}
 
@@ -1073,7 +1109,31 @@ class FastWAM(torch.nn.Module):
         )
         action_denoise_step_ms: list[float] = []
         residual_analysis_steps: list[dict[str, Any]] = []
-        current_residuals: dict[int, torch.Tensor] = {}
+        analysis_residuals: dict[int, torch.Tensor] = {}
+        c3cache_residuals: dict[int, torch.Tensor] = {}
+        c3cache_step_modes: list[str] = []
+        c3cache_full_steps = 0
+        c3cache_cached_steps = 0
+        if enable_c3cache:
+            if c3cache_start_step < 0 or c3cache_end_step < c3cache_start_step:
+                raise ValueError(
+                    "Invalid C3ache step range: "
+                    f"{c3cache_start_step}..{c3cache_end_step}"
+                )
+            if c3cache_refresh_interval < 0:
+                raise ValueError(
+                    f"`c3cache_refresh_interval` must be >= 0, got {c3cache_refresh_interval}"
+                )
+        refresh_cache_this_chunk = (
+            enable_c3cache
+            and (
+                self._c3cache_chunk_index == 0
+                or (
+                    c3cache_refresh_interval > 0
+                    and self._c3cache_chunk_index % c3cache_refresh_interval == 0
+                )
+            )
+        )
         for step_idx, (step_t_action, step_delta_action) in enumerate(
             zip(infer_timesteps_action, infer_deltas_action)
         ):
@@ -1081,45 +1141,69 @@ class FastWAM(torch.nn.Module):
             denoise_step_start = time.perf_counter()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            prediction = self._predict_action_noise_with_cache(
-                latents_action=latents_action,
-                timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
-                video_kv_cache=video_kv_cache,
-                attention_mask=attention_mask,
-                video_seq_len=video_seq_len,
-                return_intermediates=analyze_c3cache_residuals,
+            step_in_cache_range = c3cache_start_step <= step_idx <= c3cache_end_step
+            use_cached_residual = (
+                enable_c3cache
+                and step_in_cache_range
+                and not refresh_cache_this_chunk
+                and step_idx in self._c3cache_residuals
             )
-            if analyze_c3cache_residuals:
-                pred_action_posi, intermediates = prediction
-                residual = (intermediates["hL"] - intermediates["h0"]).detach()
-                current_residuals[step_idx] = residual.clone()
-                previous_residual = self._c3cache_analysis_prev_residuals.get(step_idx)
-                cosine_similarity = None
-                if previous_residual is not None:
-                    if previous_residual.shape != residual.shape:
-                        raise ValueError(
-                            "C3ache analysis residual shape changed across chunks at "
-                            f"step {step_idx}: {tuple(previous_residual.shape)} vs {tuple(residual.shape)}"
-                        )
-                    cosine_similarity = float(
-                        F.cosine_similarity(
-                            previous_residual.reshape(1, -1).float(),
-                            residual.reshape(1, -1).float(),
-                            dim=1,
-                        ).item()
-                    )
-                residual_analysis_steps.append(
-                    {
-                        "step_index": step_idx,
-                        "timestep": float(step_t_action.item()),
-                        "cosine_similarity_to_previous_chunk": cosine_similarity,
-                        "residual_l2_norm": float(residual.float().norm().item()),
-                    }
+            if use_cached_residual:
+                pred_action_posi = self._predict_action_noise_from_cached_residual(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    residual=self._c3cache_residuals[step_idx],
                 )
+                c3cache_step_modes.append("cached")
+                c3cache_cached_steps += 1
             else:
-                pred_action_posi = prediction
+                prediction = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    return_intermediates=analyze_c3cache_residuals or (enable_c3cache and step_in_cache_range),
+                )
+                if analyze_c3cache_residuals or (enable_c3cache and step_in_cache_range):
+                    pred_action_posi, intermediates = prediction
+                    residual = (intermediates["hL"] - intermediates["h0"]).detach()
+                    if enable_c3cache and step_in_cache_range:
+                        c3cache_residuals[step_idx] = residual.clone()
+                    if analyze_c3cache_residuals:
+                        analysis_residuals[step_idx] = residual.clone()
+                        previous_residual = self._c3cache_analysis_prev_residuals.get(step_idx)
+                        cosine_similarity = None
+                        if previous_residual is not None:
+                            if previous_residual.shape != residual.shape:
+                                raise ValueError(
+                                    "C3ache analysis residual shape changed across chunks at "
+                                    f"step {step_idx}: {tuple(previous_residual.shape)} vs {tuple(residual.shape)}"
+                                )
+                            cosine_similarity = float(
+                                F.cosine_similarity(
+                                    previous_residual.reshape(1, -1).float(),
+                                    residual.reshape(1, -1).float(),
+                                    dim=1,
+                                ).item()
+                            )
+                        residual_analysis_steps.append(
+                            {
+                                "step_index": step_idx,
+                                "timestep": float(step_t_action.item()),
+                                "cosine_similarity_to_previous_chunk": cosine_similarity,
+                                "residual_l2_norm": float(residual.float().norm().item()),
+                            }
+                        )
+                else:
+                    pred_action_posi = prediction
+                if enable_c3cache:
+                    c3cache_step_modes.append("full")
+                    c3cache_full_steps += 1
             pred_action = pred_action_posi
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
@@ -1136,8 +1220,22 @@ class FastWAM(torch.nn.Module):
                 "chunk_index": self._c3cache_analysis_chunk_index,
                 "steps": residual_analysis_steps,
             }
-            self._c3cache_analysis_prev_residuals = current_residuals
+            self._c3cache_analysis_prev_residuals = analysis_residuals
             self._c3cache_analysis_chunk_index += 1
+        if enable_c3cache:
+            if refresh_cache_this_chunk:
+                self._c3cache_residuals = c3cache_residuals
+            result["c3cache"] = {
+                "chunk_index": self._c3cache_chunk_index,
+                "refresh_cache": refresh_cache_this_chunk,
+                "step_modes": c3cache_step_modes,
+                "full_steps": c3cache_full_steps,
+                "cached_steps": c3cache_cached_steps,
+                "cache_start_step": c3cache_start_step,
+                "cache_end_step": c3cache_end_step,
+                "refresh_interval": c3cache_refresh_interval,
+            }
+            self._c3cache_chunk_index += 1
         if profile_timing:
             timing["action_denoise_step_ms"] = action_denoise_step_ms
             timing["action_denoise_total_ms"] = float(sum(action_denoise_step_ms))
