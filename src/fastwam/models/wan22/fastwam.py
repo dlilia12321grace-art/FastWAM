@@ -85,8 +85,14 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.reset_c3cache_analysis()
 
         self.to(self.device)
+
+    def reset_c3cache_analysis(self) -> None:
+        """Clear cross-chunk residuals at an episode boundary."""
+        self._c3cache_analysis_prev_residuals: dict[int, torch.Tensor] = {}
+        self._c3cache_analysis_chunk_index = 0
 
     @classmethod
     def from_wan22_pretrained(
@@ -702,7 +708,8 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
-    ) -> torch.Tensor:
+        return_intermediates: bool = False,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -721,7 +728,13 @@ class FastWAM(torch.nn.Module):
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
         )
-        return self.action_expert.post_dit(action_tokens, action_pre)
+        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+        if return_intermediates:
+            return pred_action, {
+                "h0": action_pre["tokens"],
+                "hL": action_tokens,
+            }
+        return pred_action
 
     @torch.no_grad()
     def infer_joint(
@@ -920,6 +933,7 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         profile_timing: bool = False,
+        analyze_c3cache_residuals: bool = False,
     ) -> dict[str, Any]:
         timing: dict[str, Any] = {}
 
@@ -1058,12 +1072,16 @@ class FastWAM(torch.nn.Module):
             shift_override=sigma_shift,
         )
         action_denoise_step_ms: list[float] = []
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+        residual_analysis_steps: list[dict[str, Any]] = []
+        current_residuals: dict[int, torch.Tensor] = {}
+        for step_idx, (step_t_action, step_delta_action) in enumerate(
+            zip(infer_timesteps_action, infer_deltas_action)
+        ):
             sync_for_timing()
             denoise_step_start = time.perf_counter()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = self._predict_action_noise_with_cache(
+            prediction = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
@@ -1071,7 +1089,37 @@ class FastWAM(torch.nn.Module):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                return_intermediates=analyze_c3cache_residuals,
             )
+            if analyze_c3cache_residuals:
+                pred_action_posi, intermediates = prediction
+                residual = (intermediates["hL"] - intermediates["h0"]).detach()
+                current_residuals[step_idx] = residual.clone()
+                previous_residual = self._c3cache_analysis_prev_residuals.get(step_idx)
+                cosine_similarity = None
+                if previous_residual is not None:
+                    if previous_residual.shape != residual.shape:
+                        raise ValueError(
+                            "C3ache analysis residual shape changed across chunks at "
+                            f"step {step_idx}: {tuple(previous_residual.shape)} vs {tuple(residual.shape)}"
+                        )
+                    cosine_similarity = float(
+                        F.cosine_similarity(
+                            previous_residual.reshape(1, -1).float(),
+                            residual.reshape(1, -1).float(),
+                            dim=1,
+                        ).item()
+                    )
+                residual_analysis_steps.append(
+                    {
+                        "step_index": step_idx,
+                        "timestep": float(step_t_action.item()),
+                        "cosine_similarity_to_previous_chunk": cosine_similarity,
+                        "residual_l2_norm": float(residual.float().norm().item()),
+                    }
+                )
+            else:
+                pred_action_posi = prediction
             pred_action = pred_action_posi
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
@@ -1083,6 +1131,13 @@ class FastWAM(torch.nn.Module):
         result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if analyze_c3cache_residuals:
+            result["c3cache_residual_analysis"] = {
+                "chunk_index": self._c3cache_analysis_chunk_index,
+                "steps": residual_analysis_steps,
+            }
+            self._c3cache_analysis_prev_residuals = current_residuals
+            self._c3cache_analysis_chunk_index += 1
         if profile_timing:
             timing["action_denoise_step_ms"] = action_denoise_step_ms
             timing["action_denoise_total_ms"] = float(sum(action_denoise_step_ms))

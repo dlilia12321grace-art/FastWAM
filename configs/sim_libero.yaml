@@ -28,6 +28,7 @@ EVALUATION:
   visualize_future_video: false
   save_rollout_video: true
   profile_timing: false
+  analyze_c3cache_residuals: false
 
   # Action inference
   action_horizon: null

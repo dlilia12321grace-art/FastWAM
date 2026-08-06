@@ -418,6 +418,9 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     if not visualize_future_video:
         infer_kwargs["profile_timing"] = profile_timing
+        infer_kwargs["analyze_c3cache_residuals"] = bool(
+            cfg.EVALUATION.get("analyze_c3cache_residuals", False)
+        )
 
     with torch.no_grad():
         if visualize_future_video:
@@ -435,10 +438,15 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
-    timing = pred.get("timing")
-    if timing is not None:
-        timing["observation_preprocess_ms"] = preprocess_ms
-    return action, imgs, predicted_future_frames, timing
+    chunk_metrics = pred.get("timing")
+    if chunk_metrics is not None:
+        chunk_metrics["observation_preprocess_ms"] = preprocess_ms
+    residual_analysis = pred.get("c3cache_residual_analysis")
+    if residual_analysis is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["c3cache_residual_analysis"] = residual_analysis
+    return action, imgs, predicted_future_frames, chunk_metrics
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -478,6 +486,11 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    if bool(cfg.EVALUATION.get("analyze_c3cache_residuals", False)):
+        reset_analysis = getattr(model, "reset_c3cache_analysis", None)
+        if reset_analysis is None:
+            raise AttributeError("Model does not provide reset_c3cache_analysis().")
+        reset_analysis()
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()
@@ -662,6 +675,9 @@ def _run_single_task_with_env(
     profile_timing = bool(cfg.EVALUATION.get("profile_timing", False))
     if profile_timing:
         results["timing_profile"] = {"episodes": []}
+    analyze_c3cache_residuals = bool(cfg.EVALUATION.get("analyze_c3cache_residuals", False))
+    if analyze_c3cache_residuals:
+        results["c3cache_residual_analysis"] = {"episodes": []}
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
         success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_chunk_timings = run_single_episode(
@@ -682,6 +698,17 @@ def _run_single_task_with_env(
                 {
                     "episode_index": trial_idx,
                     "chunks": action_chunk_timings,
+                }
+            )
+        if analyze_c3cache_residuals:
+            results["c3cache_residual_analysis"]["episodes"].append(
+                {
+                    "episode_index": trial_idx,
+                    "chunks": [
+                        chunk["c3cache_residual_analysis"]
+                        for chunk in action_chunk_timings
+                        if "c3cache_residual_analysis" in chunk
+                    ],
                 }
             )
         if success:
@@ -766,6 +793,30 @@ def _run_single_task_with_env(
             for step_idx in sorted(per_step_values)
         ]
         results["timing_profile"]["summary"] = summary
+    if analyze_c3cache_residuals:
+        similarities_by_step: dict[int, list[float]] = {}
+        num_chunks = 0
+        for episode in results["c3cache_residual_analysis"]["episodes"]:
+            num_chunks += len(episode["chunks"])
+            for chunk in episode["chunks"]:
+                for step in chunk["steps"]:
+                    similarity = step["cosine_similarity_to_previous_chunk"]
+                    if similarity is not None:
+                        similarities_by_step.setdefault(int(step["step_index"]), []).append(
+                            float(similarity)
+                        )
+        results["c3cache_residual_analysis"]["summary"] = {
+            "num_action_chunks": num_chunks,
+            "per_step": [
+                {
+                    "step_index": step_idx,
+                    "num_pairs": len(similarities_by_step[step_idx]),
+                    "cosine_similarity_mean": float(np.mean(similarities_by_step[step_idx])),
+                    "cosine_similarity_std": float(np.std(similarities_by_step[step_idx])),
+                }
+                for step_idx in sorted(similarities_by_step)
+            ],
+        }
     return results
 
 
