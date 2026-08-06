@@ -367,7 +367,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
+) -> tuple[np.ndarray, dict, Optional[list[Image.Image]], Optional[dict[str, Any]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -376,6 +376,10 @@ def _predict_action_chunk(
     prompt_template = DEFAULT_PROMPT
     prompt = prompt_template.format(task=task_description)
 
+    profile_timing = bool(cfg.EVALUATION.get("profile_timing", False))
+    if profile_timing and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    preprocess_start = time.perf_counter()
     image, proprio, imgs = _obs_to_model_input(
         obs,
         cfg=cfg,
@@ -385,6 +389,9 @@ def _predict_action_chunk(
         device=model_device,
         dtype=model.torch_dtype,
     )
+    if profile_timing and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    preprocess_ms = (time.perf_counter() - preprocess_start) * 1000.0
 
     infer_kwargs = {
         "prompt": prompt,
@@ -409,6 +416,8 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+    if not visualize_future_video:
+        infer_kwargs["profile_timing"] = profile_timing
 
     with torch.no_grad():
         if visualize_future_video:
@@ -426,7 +435,10 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
-    return action, imgs, predicted_future_frames
+    timing = pred.get("timing")
+    if timing is not None:
+        timing["observation_preprocess_ms"] = preprocess_ms
+    return action, imgs, predicted_future_frames, timing
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -455,7 +467,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list[dict[str, Any]]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -477,6 +489,7 @@ def run_single_episode(
     current_predicted_future_clip: Optional[dict[str, Any]] = None
     current_replan_step = 0
     current_replan_idx = -1
+    action_chunk_timings: list[dict[str, Any]] = []
 
     t = 0
     done = False
@@ -489,7 +502,7 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
-            action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+            action_chunk, imgs, predicted_future_frames, chunk_timing = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
                 model=model,
@@ -500,6 +513,9 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
             )
+            if chunk_timing is not None:
+                chunk_timing["replan_index"] = len(action_chunk_timings)
+                action_chunk_timings.append(chunk_timing)
             if predicted_future_frames is not None:
                 current_replan_idx += 1
                 current_predicted_future_clip = {
@@ -581,7 +597,7 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_chunk_timings
 
 
 def run_single_task(
@@ -643,9 +659,12 @@ def _run_single_task_with_env(
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
+    profile_timing = bool(cfg.EVALUATION.get("profile_timing", False))
+    if profile_timing:
+        results["timing_profile"] = {"episodes": []}
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_chunk_timings = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -658,6 +677,13 @@ def _run_single_task_with_env(
             input_h=input_h,
             model_device=model_device,
         )
+        if profile_timing:
+            results["timing_profile"]["episodes"].append(
+                {
+                    "episode_index": trial_idx,
+                    "chunks": action_chunk_timings,
+                }
+            )
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)
@@ -710,6 +736,36 @@ def _run_single_task_with_env(
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
+    if profile_timing:
+        all_chunk_timings = [
+            chunk
+            for episode in results["timing_profile"]["episodes"]
+            for chunk in episode["chunks"]
+        ]
+        summary = {"num_action_chunks": len(all_chunk_timings)}
+        scalar_keys = [
+            "observation_preprocess_ms",
+            "image_encode_ms",
+            "prompt_encode_ms",
+            "video_pre_dit_ms",
+            "video_kv_prefill_ms",
+            "action_denoise_total_ms",
+            "action_denoise_mean_ms",
+            "infer_action_total_ms",
+        ]
+        for key in scalar_keys:
+            values = [float(chunk[key]) for chunk in all_chunk_timings if key in chunk]
+            if values:
+                summary[f"{key}_mean"] = float(np.mean(values))
+        per_step_values: dict[int, list[float]] = {}
+        for chunk in all_chunk_timings:
+            for step_idx, elapsed_ms in enumerate(chunk.get("action_denoise_step_ms", [])):
+                per_step_values.setdefault(step_idx, []).append(float(elapsed_ms))
+        summary["action_denoise_step_ms_mean"] = [
+            float(np.mean(per_step_values[step_idx]))
+            for step_idx in sorted(per_step_values)
+        ]
+        results["timing_profile"]["summary"] = summary
     return results
 
 

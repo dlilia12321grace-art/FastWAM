@@ -1,3 +1,4 @@
+import time
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -918,7 +919,16 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        profile_timing: bool = False,
     ) -> dict[str, Any]:
+        timing: dict[str, Any] = {}
+
+        def sync_for_timing() -> None:
+            if profile_timing and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+
+        sync_for_timing()
+        infer_start = time.perf_counter()
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
@@ -958,7 +968,12 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        sync_for_timing()
+        image_encode_start = time.perf_counter()
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        sync_for_timing()
+        if profile_timing:
+            timing["image_encode_ms"] = (time.perf_counter() - image_encode_start) * 1000.0
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -969,7 +984,12 @@ class FastWAM(torch.nn.Module):
             raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
 
         if use_prompt:
+            sync_for_timing()
+            prompt_encode_start = time.perf_counter()
             context, context_mask = self.encode_prompt(prompt)
+            sync_for_timing()
+            if profile_timing:
+                timing["prompt_encode_ms"] = (time.perf_counter() - prompt_encode_start) * 1000.0
         else:
             if context is None or context_mask is None:
                 raise ValueError("`context` and `context_mask` must be both provided together.")
@@ -995,6 +1015,8 @@ class FastWAM(torch.nn.Module):
             dtype=first_frame_latents.dtype,
             device=self.device,
         )
+        sync_for_timing()
+        video_pre_start = time.perf_counter()
         video_pre = self.video_expert.pre_dit(
             x=first_frame_latents,
             timestep=timestep_video,
@@ -1003,6 +1025,9 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
         )
+        sync_for_timing()
+        if profile_timing:
+            timing["video_pre_dit_ms"] = (time.perf_counter() - video_pre_start) * 1000.0
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
@@ -1010,6 +1035,8 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
         )
+        sync_for_timing()
+        video_prefill_start = time.perf_counter()
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
             video_freqs=video_pre["freqs"],
@@ -1020,6 +1047,9 @@ class FastWAM(torch.nn.Module):
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
+        sync_for_timing()
+        if profile_timing:
+            timing["video_kv_prefill_ms"] = (time.perf_counter() - video_prefill_start) * 1000.0
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1027,7 +1057,10 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        action_denoise_step_ms: list[float] = []
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            sync_for_timing()
+            denoise_step_start = time.perf_counter()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
             pred_action_posi = self._predict_action_noise_with_cache(
@@ -1042,10 +1075,26 @@ class FastWAM(torch.nn.Module):
             pred_action = pred_action_posi
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            sync_for_timing()
+            if profile_timing:
+                action_denoise_step_ms.append((time.perf_counter() - denoise_step_start) * 1000.0)
 
-        return {
+        sync_for_timing()
+        result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if profile_timing:
+            timing["action_denoise_step_ms"] = action_denoise_step_ms
+            timing["action_denoise_total_ms"] = float(sum(action_denoise_step_ms))
+            timing["action_denoise_mean_ms"] = (
+                float(sum(action_denoise_step_ms) / len(action_denoise_step_ms))
+                if action_denoise_step_ms
+                else 0.0
+            )
+            timing["num_inference_steps"] = len(action_denoise_step_ms)
+            timing["infer_action_total_ms"] = (time.perf_counter() - infer_start) * 1000.0
+            result["timing"] = timing
+        return result
 
     @torch.no_grad()
     def infer(
