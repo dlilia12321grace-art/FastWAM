@@ -242,3 +242,11 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# Local Dynamic ActionGap synthetic smoke artifacts
+/.dynamic_gate_smoke/
+
+# Local Dynamic ActionGap evaluation artifacts
+/jitter_task9_goal/
+/dynamic_action_gap_story_visuals/dynamic_route_steps.csv
+/dynamic_action_gap_story_visuals/failure_heatmaps/

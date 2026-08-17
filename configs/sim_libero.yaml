@@ -27,12 +27,37 @@ EVALUATION:
   use_action_ensembler: false
   visualize_future_video: false
   save_rollout_video: true
+  save_action_trace: false
   profile_timing: false
   analyze_c3cache_residuals: false
   enable_c3cache: false
   c3cache_start_step: 0
   c3cache_end_step: 6
   c3cache_refresh_interval: 4
+
+  # Internal LoRA / ActionGap inference
+  enable_internal_lora_branch: false
+  internal_lora_checkpoint: null
+  internal_lora_fork_layer: 18
+  internal_lora_source_start_layer: 19
+  internal_lora_source_end_layer: 24
+  internal_lora_rank: 8
+  internal_lora_alpha: 16.0
+  internal_lora_inference_steps: [0]
+  internal_lora_merge_for_inference: true
+  enable_action_gap_schedule: false
+  action_gap: 2
+
+  # Learned Dynamic ActionGap routing
+  enable_dynamic_action_gap: false
+  dynamic_action_gap_checkpoint: null
+  dynamic_action_gap_threshold: null
+  dynamic_action_gap_max_internal_run: 3
+  dynamic_action_gap_anchor_action_gap: null
+  compute_matched_action_gap_mode: null
+  compute_matched_action_gap_target_internal_ratio: 0.65
+  compute_matched_action_gap_seed: 0
+  collect_dynamic_action_gap_data: false
 
   # Action inference
   action_horizon: null

@@ -38,6 +38,7 @@ from experiments.libero.libero_utils import (
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
+from fastwam.utils.action_jitter import compute_action_jitter_metrics
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
 from action_ensembler import ActionEnsembler
@@ -427,6 +428,109 @@ def _predict_action_chunk(
         infer_kwargs["c3cache_refresh_interval"] = int(
             cfg.EVALUATION.get("c3cache_refresh_interval", 4)
         )
+        infer_kwargs["analyze_internal_layers"] = bool(
+            cfg.EVALUATION.get("analyze_internal_layers", False)
+        )
+        infer_kwargs["internal_profile_layers"] = tuple(
+            int(layer)
+            for layer in cfg.EVALUATION.get("internal_profile_layers", [6, 12, 18, 24])
+        )
+        infer_kwargs["collect_internal_distillation"] = bool(
+            cfg.EVALUATION.get("collect_internal_distillation", False)
+        )
+        infer_kwargs["internal_distillation_layers"] = tuple(
+            int(layer)
+            for layer in cfg.EVALUATION.get("internal_distillation_layers", [12, 18])
+        )
+        infer_kwargs["enable_internal_head"] = bool(
+            cfg.EVALUATION.get("enable_internal_head", False)
+        )
+        infer_kwargs["internal_head_checkpoint"] = cfg.EVALUATION.get(
+            "internal_head_checkpoint", None
+        )
+        infer_kwargs["internal_head_layer"] = int(
+            cfg.EVALUATION.get("internal_head_layer", 18)
+        )
+        infer_kwargs["internal_head_steps"] = tuple(
+            int(step) for step in cfg.EVALUATION.get("internal_head_steps", [0])
+        )
+        infer_kwargs["train_internal_lora"] = bool(
+            cfg.EVALUATION.get("train_internal_lora", False)
+        )
+        infer_kwargs["internal_lora_train_steps"] = tuple(
+            int(step) for step in cfg.EVALUATION.get(
+                "internal_lora_train_steps", [0, 1, 2, 3, 4, 5, 6]
+            )
+        )
+        max_updates = cfg.EVALUATION.get("internal_lora_max_updates", None)
+        infer_kwargs["internal_lora_max_updates"] = (
+            None if max_updates is None else int(max_updates)
+        )
+        infer_kwargs["enable_internal_lora_branch"] = bool(
+            cfg.EVALUATION.get("enable_internal_lora_branch", False)
+        )
+        infer_kwargs["internal_lora_checkpoint"] = cfg.EVALUATION.get(
+            "internal_lora_checkpoint", None
+        )
+        infer_kwargs["internal_lora_fork_layer"] = int(
+            cfg.EVALUATION.get("internal_lora_fork_layer", 18)
+        )
+        infer_kwargs["internal_lora_source_start_layer"] = int(
+            cfg.EVALUATION.get("internal_lora_source_start_layer", 19)
+        )
+        infer_kwargs["internal_lora_source_end_layer"] = int(
+            cfg.EVALUATION.get("internal_lora_source_end_layer", 24)
+        )
+        infer_kwargs["internal_lora_rank"] = int(
+            cfg.EVALUATION.get("internal_lora_rank", 8)
+        )
+        infer_kwargs["internal_lora_alpha"] = float(
+            cfg.EVALUATION.get("internal_lora_alpha", 16.0)
+        )
+        infer_kwargs["internal_lora_inference_steps"] = tuple(
+            int(step) for step in cfg.EVALUATION.get("internal_lora_inference_steps", [0])
+        )
+        infer_kwargs["internal_lora_merge_for_inference"] = bool(
+            cfg.EVALUATION.get("internal_lora_merge_for_inference", True)
+        )
+        infer_kwargs["enable_action_gap_schedule"] = bool(
+            cfg.EVALUATION.get("enable_action_gap_schedule", False)
+        )
+        infer_kwargs["action_gap"] = int(cfg.EVALUATION.get("action_gap", 2))
+        infer_kwargs["enable_dynamic_action_gap"] = bool(
+            cfg.EVALUATION.get("enable_dynamic_action_gap", False)
+        )
+        infer_kwargs["dynamic_action_gap_checkpoint"] = cfg.EVALUATION.get(
+            "dynamic_action_gap_checkpoint", None
+        )
+        dynamic_threshold = cfg.EVALUATION.get("dynamic_action_gap_threshold", None)
+        infer_kwargs["dynamic_action_gap_threshold"] = (
+            None if dynamic_threshold is None else float(dynamic_threshold)
+        )
+        infer_kwargs["dynamic_action_gap_max_internal_run"] = int(
+            cfg.EVALUATION.get("dynamic_action_gap_max_internal_run", 3)
+        )
+        dynamic_anchor_gap = cfg.EVALUATION.get(
+            "dynamic_action_gap_anchor_action_gap", None
+        )
+        infer_kwargs["dynamic_action_gap_anchor_action_gap"] = (
+            None if dynamic_anchor_gap is None else int(dynamic_anchor_gap)
+        )
+        matched_mode = cfg.EVALUATION.get("compute_matched_action_gap_mode", None)
+        infer_kwargs["compute_matched_action_gap_mode"] = (
+            None if matched_mode is None else str(matched_mode)
+        )
+        infer_kwargs["compute_matched_action_gap_target_internal_ratio"] = float(
+            cfg.EVALUATION.get(
+                "compute_matched_action_gap_target_internal_ratio", 0.65
+            )
+        )
+        infer_kwargs["compute_matched_action_gap_seed"] = int(
+            cfg.EVALUATION.get("compute_matched_action_gap_seed", 0)
+        )
+        infer_kwargs["collect_dynamic_action_gap_data"] = bool(
+            cfg.EVALUATION.get("collect_dynamic_action_gap_data", False)
+        )
 
     with torch.no_grad():
         if visualize_future_video:
@@ -457,6 +561,31 @@ def _predict_action_chunk(
         if chunk_metrics is None:
             chunk_metrics = {}
         chunk_metrics["c3cache"] = c3cache_metrics
+    internal_layer_profile = pred.get("internal_layer_profile")
+    if internal_layer_profile is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["internal_layer_profile"] = internal_layer_profile
+    internal_distillation = pred.get("internal_distillation")
+    if internal_distillation is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["internal_distillation"] = internal_distillation
+    internal_lora_inference = pred.get("internal_lora_inference")
+    if internal_lora_inference is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["internal_lora_inference"] = internal_lora_inference
+    dynamic_action_gap = pred.get("dynamic_action_gap")
+    if dynamic_action_gap is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["dynamic_action_gap"] = dynamic_action_gap
+    dynamic_action_gap_collection = pred.get("dynamic_action_gap_collection")
+    if dynamic_action_gap_collection is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["dynamic_action_gap_collection"] = dynamic_action_gap_collection
     return action, imgs, predicted_future_frames, chunk_metrics
 
 
@@ -486,7 +615,15 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float], list[dict[str, Any]]]:
+) -> tuple[
+    bool,
+    list,
+    list[dict[str, Any]],
+    Optional[float],
+    list[dict[str, Any]],
+    np.ndarray,
+    list[int],
+]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -507,6 +644,15 @@ def run_single_episode(
         if reset_analysis is None:
             raise AttributeError("Model does not provide reset_c3cache_analysis().")
         reset_analysis()
+    if bool(cfg.EVALUATION.get("enable_dynamic_action_gap", False)) or cfg.EVALUATION.get(
+        "compute_matched_action_gap_mode", None
+    ) is not None:
+        reset_dynamic_gate = getattr(model, "reset_dynamic_action_gap_state", None)
+        if reset_dynamic_gate is None:
+            raise AttributeError(
+                "Model does not provide reset_dynamic_action_gap_state()."
+            )
+        reset_dynamic_gate()
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()
@@ -519,6 +665,8 @@ def run_single_episode(
     current_replan_step = 0
     current_replan_idx = -1
     action_chunk_timings: list[dict[str, Any]] = []
+    executed_actions: list[list[float]] = []
+    replan_start_indices: list[int] = []
 
     t = 0
     done = False
@@ -531,6 +679,7 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
+            replan_start_indices.append(len(executed_actions))
             action_chunk, imgs, predicted_future_frames, chunk_timing = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
@@ -567,7 +716,9 @@ def run_single_episode(
             if save_rollout:
                 replay_images.append(imgs.copy())
 
-        obs, _, done, _ = env.step(pending_actions.pop(0))
+        executed_action = pending_actions.pop(0)
+        executed_actions.append(list(executed_action))
+        obs, _, done, _ = env.step(executed_action)
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -626,7 +777,15 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, action_chunk_timings
+    return (
+        bool(done),
+        replay_images,
+        predicted_future_video_clips,
+        episode_mean_psnr,
+        action_chunk_timings,
+        np.asarray(executed_actions, dtype=np.float32),
+        replan_start_indices,
+    )
 
 
 def run_single_task(
@@ -694,9 +853,29 @@ def _run_single_task_with_env(
     analyze_c3cache_residuals = bool(cfg.EVALUATION.get("analyze_c3cache_residuals", False))
     if analyze_c3cache_residuals:
         results["c3cache_residual_analysis"] = {"episodes": []}
+    analyze_internal_layers = bool(cfg.EVALUATION.get("analyze_internal_layers", False))
+    if analyze_internal_layers:
+        results["internal_layer_profile"] = {"episodes": []}
+    save_action_trace = bool(cfg.EVALUATION.get("save_action_trace", False))
+    if save_action_trace:
+        results["action_jitter"] = {"episodes": []}
+        action_trace_dir = (
+            Path(cfg.EVALUATION.output_dir)
+            / cfg.EVALUATION.task_suite_name
+            / "action_traces"
+        )
+        action_trace_dir.mkdir(parents=True, exist_ok=True)
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr, action_chunk_timings = run_single_episode(
+        (
+            success,
+            replay_images,
+            predicted_future_video_clips,
+            episode_mean_psnr,
+            action_chunk_timings,
+            executed_actions,
+            replan_start_indices,
+        ) = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -727,11 +906,37 @@ def _run_single_task_with_env(
                     ],
                 }
             )
+        if analyze_internal_layers:
+            results["internal_layer_profile"]["episodes"].append(
+                {
+                    "episode_index": trial_idx,
+                    "chunks": [
+                        chunk["internal_layer_profile"]
+                        for chunk in action_chunk_timings
+                        if "internal_layer_profile" in chunk
+                    ],
+                }
+            )
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)
         else:
             results["failure_episodes"].append(trial_idx)
+        if save_action_trace:
+            trace_path = action_trace_dir / f"task{cfg.EVALUATION.task_id}_trial{trial_idx}_actions.npz"
+            np.savez_compressed(
+                trace_path,
+                actions=executed_actions,
+                replan_start_indices=np.asarray(replan_start_indices, dtype=np.int64),
+            )
+            results["action_jitter"]["episodes"].append({
+                "episode_index": trial_idx,
+                "success": bool(success),
+                "trace_path": str(trace_path),
+                **compute_action_jitter_metrics(
+                    executed_actions, replan_start_indices
+                ),
+            })
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
@@ -824,6 +1029,18 @@ def _run_single_task_with_env(
                 sum(1 for chunk in c3cache_chunks if bool(chunk["refresh_cache"]))
             )
         results["timing_profile"]["summary"] = summary
+    if save_action_trace:
+        jitter_episodes = results["action_jitter"]["episodes"]
+        metric_keys = [
+            key
+            for key, value in jitter_episodes[0].items()
+            if isinstance(value, (int, float))
+            and key not in {"episode_index", "success"}
+        ] if jitter_episodes else []
+        results["action_jitter"]["summary"] = {
+            f"{key}_mean": float(np.mean([episode[key] for episode in jitter_episodes]))
+            for key in metric_keys
+        }
     if analyze_c3cache_residuals:
         similarities_by_step: dict[int, list[float]] = {}
         num_chunks = 0
@@ -846,6 +1063,38 @@ def _run_single_task_with_env(
                     "cosine_similarity_std": float(np.std(similarities_by_step[step_idx])),
                 }
                 for step_idx in sorted(similarities_by_step)
+            ],
+        }
+    if analyze_internal_layers:
+        metrics: dict[tuple[int, int], dict[str, list[float]]] = {}
+        num_chunks = 0
+        for episode in results["internal_layer_profile"]["episodes"]:
+            num_chunks += len(episode["chunks"])
+            for chunk in episode["chunks"]:
+                for step in chunk["steps"]:
+                    step_idx = int(step["step_index"])
+                    for layer in step["layers"]:
+                        key = (step_idx, int(layer["layer"]))
+                        bucket = metrics.setdefault(
+                            key,
+                            {"cosine": [], "relative_l2": [], "mae": []},
+                        )
+                        bucket["cosine"].append(float(layer["cosine_similarity_to_full"]))
+                        bucket["relative_l2"].append(float(layer["relative_l2_error"]))
+                        bucket["mae"].append(float(layer["mean_absolute_error"]))
+        results["internal_layer_profile"]["summary"] = {
+            "num_action_chunks": num_chunks,
+            "per_step_layer": [
+                {
+                    "step_index": step_idx,
+                    "layer": layer,
+                    "num_samples": len(values["cosine"]),
+                    "cosine_similarity_mean": float(np.mean(values["cosine"])),
+                    "cosine_similarity_std": float(np.std(values["cosine"])),
+                    "relative_l2_error_mean": float(np.mean(values["relative_l2"])),
+                    "mean_absolute_error_mean": float(np.mean(values["mae"])),
+                }
+                for (step_idx, layer), values in sorted(metrics.items())
             ],
         }
     return results
@@ -876,6 +1125,41 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+    collect_internal_distillation = bool(
+        cfg.EVALUATION.get("collect_internal_distillation", False)
+    )
+    if collect_internal_distillation:
+        model.reset_internal_distillation_samples()
+    collect_dynamic_action_gap_data = bool(
+        cfg.EVALUATION.get("collect_dynamic_action_gap_data", False)
+    )
+    if collect_dynamic_action_gap_data:
+        model.reset_dynamic_action_gap_samples()
+    train_internal_lora = bool(cfg.EVALUATION.get("train_internal_lora", False))
+    if train_internal_lora:
+        audit = model.configure_internal_lora_branch(
+            fork_layer=int(cfg.EVALUATION.get("internal_lora_fork_layer", 18)),
+            source_start_layer=int(cfg.EVALUATION.get("internal_lora_source_start_layer", 19)),
+            source_end_layer=int(cfg.EVALUATION.get("internal_lora_source_end_layer", 24)),
+            lora_rank=int(cfg.EVALUATION.get("internal_lora_rank", 8)),
+            lora_alpha=float(cfg.EVALUATION.get("internal_lora_alpha", 16.0)),
+            learning_rate=float(cfg.EVALUATION.get("internal_lora_learning_rate", 1e-4)),
+            weight_decay=float(cfg.EVALUATION.get("internal_lora_weight_decay", 0.0)),
+            checkpoint_path=cfg.EVALUATION.get("internal_lora_resume_checkpoint", None),
+        )
+        logging.info("Internal LoRA branch audit: %s", audit)
+        if bool(cfg.EVALUATION.get("internal_lora_audit_only", False)):
+            audit_path = Path(
+                str(cfg.EVALUATION.get(
+                    "internal_lora_audit_output",
+                    Path(cfg.EVALUATION.output_dir) / "internal_lora_architecture_audit.json",
+                ))
+            )
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+            print(json.dumps(audit, indent=2))
+            print(f"Internal LoRA architecture audit saved to: {audit_path}")
+            return
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -944,6 +1228,80 @@ def eval_single_process(cfg: DictConfig):
         model_device=model_device,
     )
     results.update(task_results)
+
+    if train_internal_lora:
+        output_path = Path(str(cfg.EVALUATION.internal_lora_output_checkpoint))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        model.save_internal_lora_branch(str(output_path))
+        best_output_path = output_path.with_name(
+            f"{output_path.stem}.best{output_path.suffix}"
+        )
+        model.save_internal_lora_branch(str(best_output_path), use_best=True)
+        results["internal_lora_training"] = {
+            "checkpoint": str(output_path),
+            "best_checkpoint": str(best_output_path),
+            "audit": audit,
+            **model.get_internal_lora_training_summary(),
+        }
+
+    if collect_internal_distillation:
+        distillation_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
+        distillation_dir.mkdir(parents=True, exist_ok=True)
+        distillation_file = (
+            distillation_dir
+            / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_internal_distillation.pt"
+        )
+        samples = model.get_internal_distillation_samples()
+        torch.save(
+            {
+                "format_version": 1,
+                "task_suite": str(cfg.EVALUATION.task_suite_name),
+                "task_id": int(cfg.EVALUATION.task_id),
+                "checkpoint": str(cfg.ckpt),
+                "layers": [
+                    int(layer)
+                    for layer in cfg.EVALUATION.get("internal_distillation_layers", [12, 18])
+                ],
+                "samples": samples,
+            },
+            distillation_file,
+        )
+        results["internal_distillation_dataset"] = {
+            "path": str(distillation_file),
+            "num_samples": len(samples),
+            "size_bytes": int(distillation_file.stat().st_size),
+        }
+
+    if collect_dynamic_action_gap_data:
+        gate_data_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
+        gate_data_dir.mkdir(parents=True, exist_ok=True)
+        gate_data_file = (
+            gate_data_dir
+            / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_dynamic_action_gap.pt"
+        )
+        gate_samples = model.get_dynamic_action_gap_samples()
+        torch.save(
+            {
+                "format_version": 1,
+                "task_suite": str(cfg.EVALUATION.task_suite_name),
+                "task_id": int(cfg.EVALUATION.task_id),
+                "checkpoint": str(cfg.ckpt),
+                "internal_lora_checkpoint": str(
+                    cfg.EVALUATION.get("internal_lora_checkpoint", "")
+                ),
+                "fork_layer": int(
+                    cfg.EVALUATION.get("internal_lora_fork_layer", 18)
+                ),
+                "hidden_dim": int(model.action_expert.hidden_dim),
+                "samples": gate_samples,
+            },
+            gate_data_file,
+        )
+        results["dynamic_action_gap_dataset"] = {
+            "path": str(gate_data_file),
+            "num_samples": len(gate_samples),
+            "size_bytes": int(gate_data_file.stat().st_size),
+        }
 
     results["duration"] = time.time() - start_time
     output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name

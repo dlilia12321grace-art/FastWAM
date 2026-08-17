@@ -1,0 +1,94 @@
+{
+  "source_files": [
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task0/v4_t036_libero_10/libero_10/gpu0_task0_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task0/v4_t036_libero_object/libero_object/gpu0_task0_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task1/v4_t036_libero_10/libero_10/gpu0_task1_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task1/v4_t036_libero_object/libero_object/gpu0_task1_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task2/v4_t036_libero_10/libero_10/gpu0_task2_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task2/v4_t036_libero_object/libero_object/gpu0_task2_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task3/v4_t036_libero_10/libero_10/gpu0_task3_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task3/v4_t036_libero_object/libero_object/gpu0_task3_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task4/v4_t036_libero_10/libero_10/gpu0_task4_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task4/v4_t036_libero_object/libero_object/gpu0_task4_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task5/v4_t036_libero_10/libero_10/gpu0_task5_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task5/v4_t036_libero_object/libero_object/gpu0_task5_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task6/v4_t036_libero_10/libero_10/gpu0_task6_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task6/v4_t036_libero_object/libero_object/gpu0_task6_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task7/v4_t036_libero_10/libero_10/gpu0_task7_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task7/v4_t036_libero_object/libero_object/gpu0_task7_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task8/v4_t036_libero_10/libero_10/gpu0_task8_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task8/v4_t036_libero_object/libero_object/gpu0_task8_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task9/v4_t036_libero_10/libero_10/gpu0_task9_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_object10_v4/task9/v4_t036_libero_object/libero_object/gpu0_task9_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task1/v4_t036_libero_goal/libero_goal/gpu0_task1_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task1/v4_t036_libero_spatial/libero_spatial/gpu0_task1_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task2/v4_t036_libero_goal/libero_goal/gpu0_task2_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task2/v4_t036_libero_spatial/libero_spatial/gpu0_task2_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task3/v4_t036_libero_goal/libero_goal/gpu0_task3_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task3/v4_t036_libero_spatial/libero_spatial/gpu0_task3_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task4/v4_t036_libero_goal/libero_goal/gpu0_task4_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task4/v4_t036_libero_spatial/libero_spatial/gpu0_task4_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task5/v4_t036_libero_goal/libero_goal/gpu0_task5_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task5/v4_t036_libero_spatial/libero_spatial/gpu0_task5_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task6/v4_t036_libero_goal/libero_goal/gpu0_task6_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task6/v4_t036_libero_spatial/libero_spatial/gpu0_task6_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task7/v4_t036_libero_goal/libero_goal/gpu0_task7_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task7/v4_t036_libero_spatial/libero_spatial/gpu0_task7_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task8/v4_t036_libero_goal/libero_goal/gpu0_task8_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task8/v4_t036_libero_spatial/libero_spatial/gpu0_task8_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task9/v4_t036_libero_goal/libero_goal/gpu0_task9_results.json",
+    "/root/autodl-tmp/evaluate_results/dynamic_action_gap_cross_v4/task9/v4_t036_libero_spatial/libero_spatial/gpu0_task9_results.json"
+  ],
+  "num_step_rows": 61750,
+  "num_failure_episodes": 14,
+  "suite_summary": {
+    "libero_10": {
+      "num_steps": 26650,
+      "predicted_gap_mean": 0.24370853731824577,
+      "internal_ratio": 0.6633771106941838,
+      "route_reasons": {
+        "first_step": 2665,
+        "predicted_safe": 17679,
+        "anchor_schedule": 2665,
+        "last_step": 2665,
+        "predicted_risky": 976
+      }
+    },
+    "libero_goal": {
+      "num_steps": 11610,
+      "predicted_gap_mean": 0.24336215075904394,
+      "internal_ratio": 0.662962962962963,
+      "route_reasons": {
+        "first_step": 1161,
+        "predicted_safe": 7697,
+        "anchor_schedule": 1161,
+        "last_step": 1161,
+        "predicted_risky": 430
+      }
+    },
+    "libero_object": {
+      "num_steps": 13280,
+      "predicted_gap_mean": 0.2806801669568901,
+      "internal_ratio": 0.6190512048192771,
+      "route_reasons": {
+        "first_step": 1328,
+        "predicted_safe": 8221,
+        "anchor_schedule": 1328,
+        "last_step": 1328,
+        "predicted_risky": 1075
+      }
+    },
+    "libero_spatial": {
+      "num_steps": 10210,
+      "predicted_gap_mean": 0.2658981218627571,
+      "internal_ratio": 0.6333986287952987,
+      "route_reasons": {
+        "first_step": 1021,
+        "predicted_safe": 6467,
+        "anchor_schedule": 1021,
+        "last_step": 1021,
+        "predicted_risky": 680
+      }
+    }
+  }
+}

@@ -9,11 +9,34 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .dynamic_action_gap import (
+    DynamicActionGapGate,
+    build_compute_matched_action_gap_schedule,
+    build_dynamic_action_gap_meta,
+    load_dynamic_action_gap_gate,
+    select_dynamic_action_gap_route,
+)
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
+from .internal_action_branch import (
+    DeepCopyInternalActionBranch,
+    build_action_gap_schedule,
+)
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
+
+
+class InternalActionHead(nn.Module):
+    """Lightweight head used to decode an intermediate Action DiT state."""
+
+    def __init__(self, hidden_dim: int, action_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(hidden))
 
 
 class FastWAM(torch.nn.Module):
@@ -87,6 +110,22 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_action = float(loss_lambda_action)
         self.reset_c3cache_analysis()
         self.reset_c3cache_state()
+        self.reset_internal_distillation_samples()
+        self._internal_action_heads = nn.ModuleDict()
+        self._internal_action_heads_checkpoint: Optional[str] = None
+        self.internal_lora_branch: Optional[DeepCopyInternalActionBranch] = None
+        self._internal_lora_optimizer: Optional[torch.optim.Optimizer] = None
+        self._internal_lora_updates = 0
+        self._internal_lora_losses: list[float] = []
+        self._internal_lora_best_loss: Optional[float] = None
+        self._internal_lora_best_update: Optional[int] = None
+        self._internal_lora_best_trainable_state: Optional[dict[str, torch.Tensor]] = None
+        self._internal_lora_checkpoint: Optional[str] = None
+        self.dynamic_action_gap_gate: Optional[DynamicActionGapGate] = None
+        self._dynamic_action_gap_checkpoint: Optional[str] = None
+        self._dynamic_action_gap_default_threshold: Optional[float] = None
+        self.reset_dynamic_action_gap_state()
+        self.reset_dynamic_action_gap_samples()
 
         self.to(self.device)
 
@@ -99,6 +138,203 @@ class FastWAM(torch.nn.Module):
         """Clear C3ache residual cache at an episode boundary."""
         self._c3cache_residuals: dict[int, torch.Tensor] = {}
         self._c3cache_chunk_index = 0
+
+    def reset_internal_distillation_samples(self) -> None:
+        """Clear the in-memory Internal Head distillation sample buffer."""
+        self._internal_distillation_samples: list[dict[str, Any]] = []
+        self._internal_distillation_chunk_index = 0
+
+    def reset_dynamic_action_gap_state(self) -> None:
+        """Clear episode-level Dynamic ActionGap accounting state."""
+        self._dynamic_action_gap_chunk_index = 0
+
+    def reset_dynamic_action_gap_samples(self) -> None:
+        """Clear offline training samples for the Dynamic ActionGap gate."""
+        self._dynamic_action_gap_samples: list[dict[str, Any]] = []
+        self._dynamic_action_gap_collection_chunk_index = 0
+
+    def get_dynamic_action_gap_samples(self) -> list[dict[str, Any]]:
+        return self._dynamic_action_gap_samples
+
+    def load_dynamic_action_gap_gate(self, checkpoint_path: str) -> None:
+        """Load a trained Dynamic ActionGap gate once per model instance."""
+        if self._dynamic_action_gap_checkpoint == checkpoint_path:
+            return
+        gate, payload = load_dynamic_action_gap_gate(
+            checkpoint_path,
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+        if gate.hidden_dim != int(self.action_expert.hidden_dim):
+            raise ValueError(
+                "Dynamic ActionGap gate hidden size does not match Action DiT: "
+                f"{gate.hidden_dim} vs {self.action_expert.hidden_dim}."
+            )
+        if gate.meta_dim != 3:
+            raise ValueError(
+                f"This inference path expects three gate metadata features, got {gate.meta_dim}."
+            )
+        self.dynamic_action_gap_gate = gate
+        self._dynamic_action_gap_checkpoint = checkpoint_path
+        self._dynamic_action_gap_default_threshold = float(
+            payload["default_threshold"]
+        )
+
+    def get_internal_distillation_samples(self) -> list[dict[str, Any]]:
+        """Return samples collected by ``infer_action`` for offline head training."""
+        return self._internal_distillation_samples
+
+    def load_internal_action_heads(self, checkpoint_path: str) -> None:
+        """Load offline-distilled intermediate heads once per model instance."""
+        if self._internal_action_heads_checkpoint == checkpoint_path:
+            return
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        heads = nn.ModuleDict()
+        for layer, spec in payload["heads"].items():
+            head = InternalActionHead(
+                hidden_dim=int(spec["hidden_dim"]),
+                action_dim=int(spec["action_dim"]),
+            )
+            head.load_state_dict(spec["state_dict"], strict=True)
+            heads[str(int(layer))] = head.to(device=self.device, dtype=self.torch_dtype).eval()
+        self._internal_action_heads = heads
+        self._internal_action_heads_checkpoint = checkpoint_path
+
+    def configure_internal_lora_branch(
+        self,
+        fork_layer: int = 18,
+        source_start_layer: int = 19,
+        source_end_layer: int = 24,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0,
+        checkpoint_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create the teacher-guided deep-copy branch and its optimizer."""
+        branch = DeepCopyInternalActionBranch(
+            action_expert=self.action_expert,
+            fork_layer=fork_layer,
+            source_start_layer=source_start_layer,
+            source_end_layer=source_end_layer,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            train_output_head=True,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        if checkpoint_path:
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            if payload.get("format_version") == 2:
+                missing, unexpected = branch.load_state_dict(
+                    payload["trainable_state_dict"], strict=False
+                )
+                allowed_missing = {
+                    name for name, parameter in branch.named_parameters()
+                    if not parameter.requires_grad
+                }
+                disallowed_missing = sorted(set(missing) - allowed_missing)
+                if disallowed_missing or unexpected:
+                    raise ValueError(
+                        "Invalid adapter-only Internal LoRA checkpoint: "
+                        f"missing={disallowed_missing}, unexpected={unexpected}"
+                    )
+            else:
+                branch.load_state_dict(payload["state_dict"], strict=True)
+        self.internal_lora_branch = branch
+        self._internal_lora_checkpoint = checkpoint_path
+        trainable = [parameter for parameter in branch.parameters() if parameter.requires_grad]
+        self._internal_lora_optimizer = torch.optim.AdamW(
+            trainable, lr=learning_rate, weight_decay=weight_decay
+        )
+        self._internal_lora_updates = 0
+        self._internal_lora_losses = []
+        self._internal_lora_best_loss = None
+        self._internal_lora_best_update = None
+        self._internal_lora_best_trainable_state = None
+        all_params = sum(parameter.numel() for parameter in branch.parameters())
+        trainable_params = sum(parameter.numel() for parameter in trainable)
+        copied_independently = []
+        for offset, copied_block in enumerate(branch.blocks):
+            source_block = self.action_expert.blocks[source_start_layer - 1 + offset]
+            copied_independently.append({
+                "source_layer": source_start_layer + offset,
+                "different_module_object": copied_block is not source_block,
+                "different_q_weight_storage": (
+                    copied_block.self_attn.q.base.weight.data_ptr()
+                    != source_block.self_attn.q.weight.data_ptr()
+                ),
+            })
+        trainable_names = branch.trainable_parameter_names()
+        invalid_trainable_names = [
+            name for name in trainable_names
+            if "lora_A" not in name and "lora_B" not in name and not name.startswith("head.")
+        ]
+        if invalid_trainable_names:
+            raise RuntimeError(f"Unexpected trainable Internal Branch parameters: {invalid_trainable_names}")
+        if not all(
+            item["different_module_object"] and item["different_q_weight_storage"]
+            for item in copied_independently
+        ):
+            raise RuntimeError("Internal Branch is not an independent deep copy of the source blocks.")
+        return {
+            "source_start_layer": source_start_layer,
+            "source_end_layer": source_end_layer,
+            "fork_layer": fork_layer,
+            "num_blocks": len(branch.blocks),
+            "all_parameters": all_params,
+            "trainable_parameters": trainable_params,
+            "trainable_fraction": trainable_params / max(all_params, 1),
+            "trainable_names": trainable_names,
+            "invalid_trainable_names": invalid_trainable_names,
+            "copied_independently": copied_independently,
+        }
+
+    def _internal_lora_trainable_state(self) -> dict[str, torch.Tensor]:
+        if self.internal_lora_branch is None:
+            raise RuntimeError("Internal LoRA branch has not been configured.")
+        trainable_names = set(self.internal_lora_branch.trainable_parameter_names())
+        return {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in self.internal_lora_branch.state_dict().items()
+            if name in trainable_names
+        }
+
+    def save_internal_lora_branch(
+        self, checkpoint_path: str, *, use_best: bool = False
+    ) -> None:
+        if self.internal_lora_branch is None:
+            raise RuntimeError("Internal LoRA branch has not been configured.")
+        trainable_names = set(self.internal_lora_branch.trainable_parameter_names())
+        if use_best:
+            if self._internal_lora_best_trainable_state is None:
+                raise RuntimeError("No best Internal LoRA state has been recorded.")
+            trainable_state = self._internal_lora_best_trainable_state
+        else:
+            trainable_state = self._internal_lora_trainable_state()
+        payload = {
+            "format_version": 2,
+            "fork_layer": self.internal_lora_branch.fork_layer,
+            "source_start_layer": self.internal_lora_branch.source_start_layer,
+            "source_end_layer": self.internal_lora_branch.source_end_layer,
+            "trainable_state_dict": trainable_state,
+            "trainable_names": sorted(trainable_names),
+            "updates": self._internal_lora_updates,
+            "losses": self._internal_lora_losses,
+            "saved_state": "best" if use_best else "final",
+            "best_loss": self._internal_lora_best_loss,
+            "best_update": self._internal_lora_best_update,
+        }
+        torch.save(payload, checkpoint_path)
+
+    def get_internal_lora_training_summary(self) -> dict[str, Any]:
+        losses = self._internal_lora_losses
+        return {
+            "updates": self._internal_lora_updates,
+            "loss_mean": float(sum(losses) / len(losses)) if losses else None,
+            "loss_first": losses[0] if losses else None,
+            "loss_last": losses[-1] if losses else None,
+            "best_loss": self._internal_lora_best_loss,
+            "best_update": self._internal_lora_best_update,
+        }
 
     @classmethod
     def from_wan22_pretrained(
@@ -715,6 +951,8 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
         return_intermediates: bool = False,
+        capture_layers: Optional[set[int]] = None,
+        stop_after_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -722,7 +960,7 @@ class FastWAM(torch.nn.Module):
             context=context,
             context_mask=context_mask,
         )
-        action_tokens = self.mot.forward_action_with_video_cache(
+        action_forward = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
             action_freqs=action_pre["freqs"],
             action_t_mod=action_pre["t_mod"],
@@ -733,13 +971,31 @@ class FastWAM(torch.nn.Module):
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
+            capture_layers=capture_layers,
+            stop_after_layer=stop_after_layer,
         )
+        if capture_layers:
+            action_tokens, captured_tokens = action_forward
+        else:
+            action_tokens = action_forward
+            captured_tokens = {}
         pred_action = self.action_expert.post_dit(action_tokens, action_pre)
-        if return_intermediates:
-            return pred_action, {
+        if return_intermediates or capture_layers:
+            intermediates = {
                 "h0": action_pre["tokens"],
                 "hL": action_tokens,
+                "action_freqs": action_pre["freqs"],
+                "action_t_mod": action_pre["t_mod"],
+                "action_context": action_pre["context"],
+                "action_context_mask": action_pre["context_mask"],
             }
+            if capture_layers:
+                intermediates["captured_tokens"] = captured_tokens
+                intermediates["layer_predictions"] = {
+                    layer: self.action_expert.post_dit(tokens, action_pre)
+                    for layer, tokens in captured_tokens.items()
+                }
+            return pred_action, intermediates
         return pred_action
 
     @torch.no_grad()
@@ -970,6 +1226,37 @@ class FastWAM(torch.nn.Module):
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
+        analyze_internal_layers: bool = False,
+        internal_profile_layers: tuple[int, ...] = (6, 12, 18, 24),
+        collect_internal_distillation: bool = False,
+        internal_distillation_layers: tuple[int, ...] = (12, 18),
+        enable_internal_head: bool = False,
+        internal_head_checkpoint: Optional[str] = None,
+        internal_head_layer: int = 18,
+        internal_head_steps: tuple[int, ...] = (0,),
+        train_internal_lora: bool = False,
+        internal_lora_train_steps: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6),
+        internal_lora_max_updates: Optional[int] = None,
+        enable_internal_lora_branch: bool = False,
+        internal_lora_checkpoint: Optional[str] = None,
+        internal_lora_fork_layer: int = 18,
+        internal_lora_source_start_layer: int = 19,
+        internal_lora_source_end_layer: int = 24,
+        internal_lora_rank: int = 8,
+        internal_lora_alpha: float = 16.0,
+        internal_lora_inference_steps: tuple[int, ...] = (0,),
+        internal_lora_merge_for_inference: bool = True,
+        enable_action_gap_schedule: bool = False,
+        action_gap: int = 2,
+        enable_dynamic_action_gap: bool = False,
+        dynamic_action_gap_checkpoint: Optional[str] = None,
+        dynamic_action_gap_threshold: Optional[float] = None,
+        dynamic_action_gap_max_internal_run: int = 3,
+        dynamic_action_gap_anchor_action_gap: Optional[int] = None,
+        compute_matched_action_gap_mode: Optional[str] = None,
+        compute_matched_action_gap_target_internal_ratio: float = 0.65,
+        compute_matched_action_gap_seed: int = 0,
+        collect_dynamic_action_gap_data: bool = False,
     ) -> dict[str, Any]:
         timing: dict[str, Any] = {}
 
@@ -1114,6 +1401,201 @@ class FastWAM(torch.nn.Module):
         c3cache_step_modes: list[str] = []
         c3cache_full_steps = 0
         c3cache_cached_steps = 0
+        internal_layer_steps: list[dict[str, Any]] = []
+        profile_layers = tuple(sorted(set(int(layer) for layer in internal_profile_layers)))
+        if analyze_internal_layers:
+            invalid_layers = [
+                layer for layer in profile_layers
+                if layer < 1 or layer >= self.mot.num_layers
+            ]
+            if invalid_layers:
+                raise ValueError(
+                    "Internal profiling layers must be 1-based and strictly shallower than "
+                    f"the full {self.mot.num_layers}-layer ActionDiT; got {invalid_layers}."
+                )
+        distillation_layers = tuple(
+            sorted(set(int(layer) for layer in internal_distillation_layers))
+        )
+        if collect_internal_distillation:
+            invalid_layers = [
+                layer for layer in distillation_layers
+                if layer < 1 or layer >= self.mot.num_layers
+            ]
+            if invalid_layers:
+                raise ValueError(
+                    "Internal distillation layers must be 1-based and strictly shallower than "
+                    f"the full {self.mot.num_layers}-layer ActionDiT; got {invalid_layers}."
+                )
+        captured_layers = set(profile_layers if analyze_internal_layers else ())
+        if collect_internal_distillation:
+            captured_layers.update(distillation_layers)
+        internal_head_steps_set = {int(step) for step in internal_head_steps}
+        if enable_internal_head:
+            if enable_c3cache:
+                raise ValueError("Internal Head and C3ache cannot be enabled together in this prototype.")
+            if analyze_internal_layers or collect_internal_distillation:
+                raise ValueError("Disable profiling/collection when deploying the Internal Head.")
+            if not internal_head_checkpoint:
+                raise ValueError("`internal_head_checkpoint` is required when Internal Head is enabled.")
+            if not 1 <= internal_head_layer < self.mot.num_layers:
+                raise ValueError(
+                    f"`internal_head_layer` must be in [1, {self.mot.num_layers - 1}]."
+                )
+            self.load_internal_action_heads(internal_head_checkpoint)
+            if str(internal_head_layer) not in self._internal_action_heads:
+                raise ValueError(
+                    f"Checkpoint does not contain a head for layer {internal_head_layer}."
+                )
+            invalid_steps = sorted(
+                step for step in internal_head_steps_set
+                if step < 0 or step >= len(infer_timesteps_action)
+            )
+            if invalid_steps:
+                raise ValueError(f"Invalid Internal Head denoise steps: {invalid_steps}.")
+        internal_head_used_steps: list[int] = []
+        internal_lora_train_steps_set = {int(step) for step in internal_lora_train_steps}
+        internal_lora_inference_steps_set = {
+            int(step) for step in internal_lora_inference_steps
+        }
+        action_gap_schedule: Optional[list[str]] = None
+        compute_matched_mode = (
+            None
+            if compute_matched_action_gap_mode is None
+            else str(compute_matched_action_gap_mode).strip().lower()
+        )
+        if collect_dynamic_action_gap_data:
+            if enable_dynamic_action_gap or enable_action_gap_schedule or compute_matched_mode:
+                raise ValueError(
+                    "Dynamic ActionGap data collection must run the full teacher path."
+                )
+            if not enable_internal_lora_branch:
+                raise ValueError(
+                    "Dynamic ActionGap data collection requires Internal LoRA inference."
+                )
+            internal_lora_inference_steps_set = set()
+        enabled_routing_modes = sum(
+            bool(mode)
+            for mode in (
+                enable_dynamic_action_gap,
+                enable_action_gap_schedule,
+                compute_matched_mode,
+            )
+        )
+        if enabled_routing_modes > 1:
+            raise ValueError(
+                "Dynamic, fixed ActionGap, and compute-matched routing are mutually exclusive."
+            )
+        if enable_dynamic_action_gap:
+            if not enable_internal_lora_branch:
+                raise ValueError(
+                    "`enable_dynamic_action_gap=True` requires Internal LoRA inference."
+                )
+            if not dynamic_action_gap_checkpoint:
+                raise ValueError(
+                    "`dynamic_action_gap_checkpoint` is required for dynamic routing."
+                )
+            if dynamic_action_gap_max_internal_run <= 0:
+                raise ValueError(
+                    "`dynamic_action_gap_max_internal_run` must be positive."
+                )
+            if (
+                dynamic_action_gap_anchor_action_gap is not None
+                and dynamic_action_gap_anchor_action_gap <= 0
+            ):
+                raise ValueError(
+                    "`dynamic_action_gap_anchor_action_gap` must be positive."
+                )
+            # The learned gate, rather than an explicit step list, chooses the route.
+            internal_lora_inference_steps_set = set()
+        if enable_action_gap_schedule:
+            if not enable_internal_lora_branch:
+                raise ValueError(
+                    "`enable_action_gap_schedule=True` requires Internal LoRA inference."
+                )
+            action_gap_schedule = build_action_gap_schedule(
+                num_steps=len(infer_timesteps_action), action_gap=action_gap
+            )
+            internal_lora_inference_steps_set = {
+                step for step, mode in enumerate(action_gap_schedule)
+                if mode == "internal"
+            }
+        if compute_matched_mode:
+            if compute_matched_mode not in {"fixed", "random"}:
+                raise ValueError(
+                    "`compute_matched_action_gap_mode` must be 'fixed' or 'random'."
+                )
+            if not enable_internal_lora_branch:
+                raise ValueError(
+                    "Compute-matched ActionGap routing requires Internal LoRA inference."
+                )
+            action_gap_schedule = build_compute_matched_action_gap_schedule(
+                num_steps=len(infer_timesteps_action),
+                chunk_index=self._dynamic_action_gap_chunk_index,
+                target_internal_ratio=compute_matched_action_gap_target_internal_ratio,
+                mode=compute_matched_mode,
+                seed=compute_matched_action_gap_seed,
+                max_internal_run=dynamic_action_gap_max_internal_run,
+                anchor_action_gap=dynamic_action_gap_anchor_action_gap,
+            )
+            internal_lora_inference_steps_set = {
+                step for step, route in enumerate(action_gap_schedule)
+                if route == "internal"
+            }
+        if enable_internal_lora_branch:
+            if train_internal_lora or enable_internal_head or enable_c3cache:
+                raise ValueError(
+                    "Internal LoRA inference must run without online training, linear Internal Head, or C3ache."
+                )
+            if analyze_internal_layers or collect_internal_distillation:
+                raise ValueError("Disable profiling/collection for Internal LoRA inference.")
+            if not internal_lora_checkpoint:
+                raise ValueError("`internal_lora_checkpoint` is required for inference.")
+            if (
+                self.internal_lora_branch is None
+                or self._internal_lora_checkpoint != internal_lora_checkpoint
+            ):
+                self.configure_internal_lora_branch(
+                    fork_layer=internal_lora_fork_layer,
+                    source_start_layer=internal_lora_source_start_layer,
+                    source_end_layer=internal_lora_source_end_layer,
+                    lora_rank=internal_lora_rank,
+                    lora_alpha=internal_lora_alpha,
+                    checkpoint_path=internal_lora_checkpoint,
+                )
+                if internal_lora_merge_for_inference:
+                    self.internal_lora_branch.merge_lora_for_inference()
+            invalid_steps = sorted(
+                step for step in internal_lora_inference_steps_set
+                if step < 0 or step >= len(infer_timesteps_action)
+            )
+            if invalid_steps:
+                raise ValueError(f"Invalid Internal LoRA inference steps: {invalid_steps}.")
+        dynamic_action_gap_effective_threshold: Optional[float] = None
+        if enable_dynamic_action_gap:
+            self.load_dynamic_action_gap_gate(str(dynamic_action_gap_checkpoint))
+            if self.internal_lora_branch.fork_layer != internal_lora_fork_layer:
+                raise ValueError(
+                    "Dynamic ActionGap gate must route at the configured Internal LoRA fork layer."
+                )
+            dynamic_action_gap_effective_threshold = (
+                self._dynamic_action_gap_default_threshold
+                if dynamic_action_gap_threshold is None
+                else float(dynamic_action_gap_threshold)
+            )
+            if dynamic_action_gap_effective_threshold is None:
+                raise ValueError("Dynamic ActionGap threshold is unavailable.")
+        if collect_dynamic_action_gap_data:
+            captured_layers.add(self.internal_lora_branch.fork_layer)
+        internal_lora_used_steps: list[int] = []
+        internal_lora_step_modes: list[str] = []
+        dynamic_action_gap_steps: list[dict[str, Any]] = []
+        dynamic_steps_since_full = 0
+        if train_internal_lora and (
+            self.internal_lora_branch is None or self._internal_lora_optimizer is None
+        ):
+            raise RuntimeError("Configure the Internal LoRA branch before online distillation.")
+        if train_internal_lora:
+            captured_layers.add(self.internal_lora_branch.fork_layer)
         if enable_c3cache:
             if c3cache_start_step < 0 or c3cache_end_step < c3cache_start_step:
                 raise ValueError(
@@ -1148,7 +1630,150 @@ class FastWAM(torch.nn.Module):
                 and not refresh_cache_this_chunk
                 and step_idx in self._c3cache_residuals
             )
-            if use_cached_residual:
+            use_internal_head = enable_internal_head and step_idx in internal_head_steps_set
+            use_internal_lora = (
+                enable_internal_lora_branch
+                and step_idx in internal_lora_inference_steps_set
+            )
+            if enable_internal_lora_branch and not enable_dynamic_action_gap:
+                internal_lora_step_modes.append(
+                    "internal" if use_internal_lora else "full"
+                )
+            if enable_dynamic_action_gap:
+                branch = self.internal_lora_branch
+                branch_input_layer = branch.fork_layer
+                _, intermediates = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    return_intermediates=True,
+                    capture_layers={branch_input_layer},
+                    stop_after_layer=branch_input_layer,
+                )
+                fork_hidden = intermediates["captured_tokens"][branch_input_layer]
+                pooled_hidden = fork_hidden.mean(dim=1)
+                gate_meta = build_dynamic_action_gap_meta(
+                    batch_size=int(pooled_hidden.shape[0]),
+                    timestep=float(step_t_action.item()),
+                    step_index=step_idx,
+                    num_steps=len(infer_timesteps_action),
+                    steps_since_full=dynamic_steps_since_full,
+                    max_internal_run=dynamic_action_gap_max_internal_run,
+                    device=pooled_hidden.device,
+                    dtype=pooled_hidden.dtype,
+                )
+                predicted_gap = float(
+                    self.dynamic_action_gap_gate(pooled_hidden, gate_meta)
+                    .float()
+                    .item()
+                )
+                route, route_reason = select_dynamic_action_gap_route(
+                    predicted_gap=predicted_gap,
+                    threshold=dynamic_action_gap_effective_threshold,
+                    step_index=step_idx,
+                    num_steps=len(infer_timesteps_action),
+                    steps_since_full=dynamic_steps_since_full,
+                    max_internal_run=dynamic_action_gap_max_internal_run,
+                    anchor_action_gap=dynamic_action_gap_anchor_action_gap,
+                )
+                if route == "internal":
+                    branch_tokens = self.mot.forward_internal_action_branch_with_video_cache(
+                        action_tokens=fork_hidden,
+                        branch_blocks=branch.blocks,
+                        source_start_layer=branch.source_start_layer,
+                        action_freqs=intermediates["action_freqs"],
+                        action_t_mod=intermediates["action_t_mod"],
+                        action_context_payload={
+                            "context": intermediates["action_context"],
+                            "mask": intermediates["action_context_mask"],
+                        },
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                    )
+                    pred_action_posi = branch.head(branch_tokens)
+                    internal_lora_used_steps.append(step_idx)
+                    dynamic_steps_since_full += 1
+                else:
+                    full_tokens = self.mot.forward_internal_action_branch_with_video_cache(
+                        action_tokens=fork_hidden,
+                        branch_blocks=self.action_expert.blocks[branch_input_layer:],
+                        source_start_layer=branch_input_layer + 1,
+                        action_freqs=intermediates["action_freqs"],
+                        action_t_mod=intermediates["action_t_mod"],
+                        action_context_payload={
+                            "context": intermediates["action_context"],
+                            "mask": intermediates["action_context_mask"],
+                        },
+                        video_kv_cache=video_kv_cache,
+                        attention_mask=attention_mask,
+                        video_seq_len=video_seq_len,
+                    )
+                    pred_action_posi = self.action_expert.head(full_tokens)
+                    dynamic_steps_since_full = 0
+                internal_lora_step_modes.append(route)
+                dynamic_action_gap_steps.append({
+                    "step": int(step_idx),
+                    "timestep": float(step_t_action.item()),
+                    "predicted_gap": predicted_gap,
+                    "threshold": float(dynamic_action_gap_effective_threshold),
+                    "route": route,
+                    "reason": route_reason,
+                })
+            elif use_internal_lora:
+                branch = self.internal_lora_branch
+                branch_input_layer = branch.fork_layer
+                prediction = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    return_intermediates=True,
+                    capture_layers={branch_input_layer},
+                    stop_after_layer=branch_input_layer,
+                )
+                _, intermediates = prediction
+                branch_tokens = self.mot.forward_internal_action_branch_with_video_cache(
+                    action_tokens=intermediates["captured_tokens"][branch_input_layer],
+                    branch_blocks=branch.blocks,
+                    source_start_layer=branch.source_start_layer,
+                    action_freqs=intermediates["action_freqs"],
+                    action_t_mod=intermediates["action_t_mod"],
+                    action_context_payload={
+                        "context": intermediates["action_context"],
+                        "mask": intermediates["action_context_mask"],
+                    },
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+                pred_action_posi = branch.head(branch_tokens)
+                internal_lora_used_steps.append(step_idx)
+            elif use_internal_head:
+                prediction = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    return_intermediates=True,
+                    capture_layers={internal_head_layer},
+                    stop_after_layer=internal_head_layer,
+                )
+                _, intermediates = prediction
+                hidden = intermediates["captured_tokens"][internal_head_layer]
+                pred_action_posi = self._internal_action_heads[str(internal_head_layer)](hidden)
+                internal_head_used_steps.append(step_idx)
+            elif use_cached_residual:
                 pred_action_posi = self._predict_action_noise_from_cached_residual(
                     latents_action=latents_action,
                     timestep_action=timestep_action,
@@ -1167,10 +1792,151 @@ class FastWAM(torch.nn.Module):
                     video_kv_cache=video_kv_cache,
                     attention_mask=attention_mask,
                     video_seq_len=video_seq_len,
-                    return_intermediates=analyze_c3cache_residuals or (enable_c3cache and step_in_cache_range),
+                    return_intermediates=(
+                        analyze_c3cache_residuals
+                        or (enable_c3cache and step_in_cache_range)
+                        or analyze_internal_layers
+                        or collect_internal_distillation
+                        or train_internal_lora
+                        or collect_dynamic_action_gap_data
+                    ),
+                    capture_layers=captured_layers or None,
                 )
-                if analyze_c3cache_residuals or (enable_c3cache and step_in_cache_range):
+                if (
+                    analyze_c3cache_residuals
+                    or (enable_c3cache and step_in_cache_range)
+                    or analyze_internal_layers
+                    or collect_internal_distillation
+                    or train_internal_lora
+                    or collect_dynamic_action_gap_data
+                ):
                     pred_action_posi, intermediates = prediction
+                    if collect_internal_distillation:
+                        self._internal_distillation_samples.append(
+                            {
+                                "chunk_index": int(self._internal_distillation_chunk_index),
+                                "step_index": int(step_idx),
+                                "timestep": timestep_action.detach().to(
+                                    device="cpu", dtype=torch.float32
+                                ),
+                                "teacher_prediction": pred_action_posi.detach().to(
+                                    device="cpu", dtype=torch.bfloat16
+                                ),
+                                "hidden_by_layer": {
+                                    int(layer): intermediates["captured_tokens"][layer]
+                                    .detach()
+                                    .to(device="cpu", dtype=torch.bfloat16)
+                                    for layer in distillation_layers
+                                },
+                            }
+                        )
+                    if collect_dynamic_action_gap_data:
+                        branch = self.internal_lora_branch
+                        branch_input_layer = branch.fork_layer
+                        fork_hidden = intermediates["captured_tokens"][branch_input_layer]
+                        branch_tokens = self.mot.forward_internal_action_branch_with_video_cache(
+                            action_tokens=fork_hidden,
+                            branch_blocks=branch.blocks,
+                            source_start_layer=branch.source_start_layer,
+                            action_freqs=intermediates["action_freqs"],
+                            action_t_mod=intermediates["action_t_mod"],
+                            action_context_payload={
+                                "context": intermediates["action_context"],
+                                "mask": intermediates["action_context_mask"],
+                            },
+                            video_kv_cache=video_kv_cache,
+                            attention_mask=attention_mask,
+                            video_seq_len=video_seq_len,
+                        )
+                        internal_prediction = branch.head(branch_tokens)
+                        teacher_float = pred_action_posi.float()
+                        normalized_gap = (
+                            (internal_prediction.float() - teacher_float).square().mean()
+                            / teacher_float.square().mean().clamp_min(1e-12)
+                        )
+                        self._dynamic_action_gap_samples.append({
+                            "chunk_index": int(
+                                self._dynamic_action_gap_collection_chunk_index
+                            ),
+                            "step_index": int(step_idx),
+                            "num_steps": int(len(infer_timesteps_action)),
+                            "timestep": float(step_t_action.item()),
+                            "pooled_hidden": fork_hidden.mean(dim=1)
+                            .detach()
+                            .to(device="cpu", dtype=torch.bfloat16),
+                            "gap": float(normalized_gap.detach().cpu()),
+                        })
+                    update_budget_available = (
+                        internal_lora_max_updates is None
+                        or self._internal_lora_updates < internal_lora_max_updates
+                    )
+                    if (
+                        train_internal_lora
+                        and update_budget_available
+                        and step_idx in internal_lora_train_steps_set
+                    ):
+                        branch = self.internal_lora_branch
+                        branch_input_layer = branch.fork_layer
+                        branch_input = intermediates["captured_tokens"][branch_input_layer].detach()
+                        teacher_target = pred_action_posi.detach()
+                        self._internal_lora_optimizer.zero_grad(set_to_none=True)
+                        with torch.enable_grad():
+                            branch_tokens = self.mot.forward_internal_action_branch_with_video_cache(
+                                action_tokens=branch_input,
+                                branch_blocks=branch.blocks,
+                                source_start_layer=branch.source_start_layer,
+                                action_freqs=intermediates["action_freqs"].detach(),
+                                action_t_mod=intermediates["action_t_mod"].detach(),
+                                action_context_payload={
+                                    "context": intermediates["action_context"].detach(),
+                                    "mask": intermediates["action_context_mask"],
+                                },
+                                video_kv_cache=[
+                                    {key: value.detach() for key, value in item.items()}
+                                    for item in video_kv_cache
+                                ],
+                                attention_mask=attention_mask,
+                                video_seq_len=video_seq_len,
+                            )
+                            student_prediction = branch.head(branch_tokens)
+                            distillation_loss = F.mse_loss(
+                                student_prediction.float(), teacher_target.float()
+                            )
+                            distillation_loss.backward()
+                        self._internal_lora_optimizer.step()
+                        self._internal_lora_updates += 1
+                        loss_value = float(distillation_loss.detach().cpu())
+                        self._internal_lora_losses.append(loss_value)
+                        if (
+                            self._internal_lora_best_loss is None
+                            or loss_value < self._internal_lora_best_loss
+                        ):
+                            self._internal_lora_best_loss = loss_value
+                            self._internal_lora_best_update = self._internal_lora_updates
+                            self._internal_lora_best_trainable_state = (
+                                self._internal_lora_trainable_state()
+                            )
+                    if analyze_internal_layers:
+                        layer_metrics = []
+                        full_flat = pred_action_posi.reshape(1, -1).float()
+                        for layer, layer_prediction in intermediates["layer_predictions"].items():
+                            layer_flat = layer_prediction.reshape(1, -1).float()
+                            diff = layer_flat - full_flat
+                            layer_metrics.append({
+                                "layer": int(layer),
+                                "cosine_similarity_to_full": float(
+                                    F.cosine_similarity(layer_flat, full_flat, dim=1).item()
+                                ),
+                                "relative_l2_error": float(
+                                    diff.norm().div(full_flat.norm().clamp_min(1e-12)).item()
+                                ),
+                                "mean_absolute_error": float(diff.abs().mean().item()),
+                            })
+                        internal_layer_steps.append({
+                            "step_index": int(step_idx),
+                            "timestep": float(step_t_action.item()),
+                            "layers": layer_metrics,
+                        })
                     residual = (intermediates["hL"] - intermediates["h0"]).detach()
                     if enable_c3cache and step_in_cache_range:
                         c3cache_residuals[step_idx] = residual.clone()
@@ -1236,6 +2002,91 @@ class FastWAM(torch.nn.Module):
                 "refresh_interval": c3cache_refresh_interval,
             }
             self._c3cache_chunk_index += 1
+        if analyze_internal_layers:
+            result["internal_layer_profile"] = {
+                "profile_layers": list(profile_layers),
+                "steps": internal_layer_steps,
+            }
+        if collect_internal_distillation:
+            result["internal_distillation"] = {
+                "chunk_index": int(self._internal_distillation_chunk_index),
+                "layers": list(distillation_layers),
+                "num_samples": len(infer_timesteps_action),
+            }
+            self._internal_distillation_chunk_index += 1
+        if collect_dynamic_action_gap_data:
+            result["dynamic_action_gap_collection"] = {
+                "chunk_index": int(self._dynamic_action_gap_collection_chunk_index),
+                "num_samples": int(len(infer_timesteps_action)),
+                "fork_layer": int(self.internal_lora_branch.fork_layer),
+            }
+            self._dynamic_action_gap_collection_chunk_index += 1
+        if enable_internal_head:
+            result["internal_head"] = {
+                "layer": int(internal_head_layer),
+                "configured_steps": sorted(internal_head_steps_set),
+                "used_steps": internal_head_used_steps,
+            }
+        if train_internal_lora:
+            result["internal_lora_training"] = self.get_internal_lora_training_summary()
+        if enable_internal_lora_branch:
+            result["internal_lora_inference"] = {
+                "source_start_layer": self.internal_lora_branch.source_start_layer,
+                "source_end_layer": self.internal_lora_branch.source_end_layer,
+                "fork_layer": self.internal_lora_branch.fork_layer,
+                "configured_steps": sorted(internal_lora_inference_steps_set),
+                "used_steps": internal_lora_used_steps,
+                "schedule_type": (
+                    "dynamic_action_gap"
+                    if enable_dynamic_action_gap
+                    else f"compute_matched_{compute_matched_mode}"
+                    if compute_matched_mode
+                    else "action_gap"
+                    if enable_action_gap_schedule
+                    else "explicit_steps"
+                ),
+                "action_gap": int(action_gap) if enable_action_gap_schedule else None,
+                "step_modes": internal_lora_step_modes,
+                "full_steps": [
+                    step for step, mode in enumerate(internal_lora_step_modes)
+                    if mode == "full"
+                ],
+                "internal_steps": [
+                    step for step, mode in enumerate(internal_lora_step_modes)
+                    if mode == "internal"
+                ],
+            }
+            if enable_dynamic_action_gap:
+                result["dynamic_action_gap"] = {
+                    "chunk_index": int(self._dynamic_action_gap_chunk_index),
+                    "checkpoint": str(dynamic_action_gap_checkpoint),
+                    "threshold": float(dynamic_action_gap_effective_threshold),
+                    "max_internal_run": int(dynamic_action_gap_max_internal_run),
+                    "anchor_action_gap": (
+                        None
+                        if dynamic_action_gap_anchor_action_gap is None
+                        else int(dynamic_action_gap_anchor_action_gap)
+                    ),
+                    "steps": dynamic_action_gap_steps,
+                }
+                self._dynamic_action_gap_chunk_index += 1
+            elif compute_matched_mode:
+                result["compute_matched_action_gap"] = {
+                    "chunk_index": int(self._dynamic_action_gap_chunk_index),
+                    "mode": compute_matched_mode,
+                    "target_internal_ratio": float(
+                        compute_matched_action_gap_target_internal_ratio
+                    ),
+                    "seed": int(compute_matched_action_gap_seed),
+                    "max_internal_run": int(dynamic_action_gap_max_internal_run),
+                    "anchor_action_gap": (
+                        None
+                        if dynamic_action_gap_anchor_action_gap is None
+                        else int(dynamic_action_gap_anchor_action_gap)
+                    ),
+                    "schedule": list(action_gap_schedule or []),
+                }
+                self._dynamic_action_gap_chunk_index += 1
         if profile_timing:
             timing["action_denoise_step_ms"] = action_denoise_step_ms
             timing["action_denoise_total_ms"] = float(sum(action_denoise_step_ms))

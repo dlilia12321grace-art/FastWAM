@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -349,7 +349,9 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
-    ) -> torch.Tensor:
+        capture_layers: Optional[set[int]] = None,
+        stop_after_layer: Optional[int] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
         Args:
@@ -389,6 +391,18 @@ class MoT(nn.Module):
 
         expert = self.mixtures["action"]
         x = action_tokens
+        captured: dict[int, torch.Tensor] = {}
+        capture_layers = set() if capture_layers is None else set(capture_layers)
+        if stop_after_layer is not None and not 1 <= stop_after_layer <= self.num_layers:
+            raise ValueError(
+                f"`stop_after_layer` must be in [1, {self.num_layers}], got {stop_after_layer}."
+            )
+        invalid_layers = sorted(layer for layer in capture_layers if layer < 1 or layer > self.num_layers)
+        if invalid_layers:
+            raise ValueError(
+                f"`capture_layers` must use 1-based layer indices in [1, {self.num_layers}], "
+                f"got {invalid_layers}."
+            )
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
             # Action query/key/value are still step-dependent and must be recomputed each step.
@@ -439,6 +453,59 @@ class MoT(nn.Module):
                 scale_mlp=scale_mlp,
                 gate_mlp=gate_mlp,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+            layer_number = layer_idx + 1
+            if layer_number in capture_layers:
+                captured[layer_number] = x
+            if stop_after_layer is not None and layer_number == stop_after_layer:
+                break
+        if capture_layers:
+            return x, captured
+        return x
+
+    def forward_internal_action_branch_with_video_cache(
+        self,
+        action_tokens: torch.Tensor,
+        branch_blocks: nn.ModuleList,
+        source_start_layer: int,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        """Run deep-copied action blocks against their source layers' video K/V."""
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = video_seq_len + action_seq_len
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+        x = action_tokens
+        expert = self.mixtures["action"]
+        for offset, block in enumerate(branch_blocks):
+            source_idx = source_start_layer - 1 + offset
+            (
+                q_action, k_action, v_action, residual_x, gate_msa,
+                shift_mlp, scale_mlp, gate_mlp, _,
+            ) = self._build_expert_attention_io(
+                expert=expert, block=block, x=x, freqs=action_freqs, t_mod=action_t_mod
+            )
+            layer_cache = video_kv_cache[source_idx]
+            mixed = self._mixed_attention(
+                q_cat=q_action,
+                k_cat=torch.cat([layer_cache["k"], k_action], dim=1),
+                v_cat=torch.cat([layer_cache["v"], v_action], dim=1),
+                attention_mask=action_attention_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=False,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
             )
