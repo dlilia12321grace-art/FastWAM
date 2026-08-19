@@ -86,23 +86,31 @@ class DeepCopyInternalActionBranch(nn.Module):
     def __init__(
         self,
         action_expert: nn.Module,
-        fork_layer: int = 18,
-        source_start_layer: int = 19,
-        source_end_layer: int = 24,
+        fork_layer: int = 4,
+        source_start_layer: int = 30,
+        source_end_layer: int = 30,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         train_output_head: bool = True,
     ):
         super().__init__()
-        if not 1 <= source_start_layer <= source_end_layer <= len(action_expert.blocks):
+        zero_block_branch = source_end_layer == source_start_layer - 1
+        if zero_block_branch:
+            if not 1 <= source_start_layer <= len(action_expert.blocks):
+                raise ValueError("Invalid source layer anchor for zero-block branch.")
+        elif not 1 <= source_start_layer <= source_end_layer <= len(action_expert.blocks):
             raise ValueError("Invalid 1-based source layer range.")
         if not 1 <= fork_layer < len(action_expert.blocks):
             raise ValueError("`fork_layer` must be a valid non-final 1-based layer.")
         self.fork_layer = int(fork_layer)
         self.source_start_layer = int(source_start_layer)
         self.source_end_layer = int(source_end_layer)
-        self.blocks = copy.deepcopy(
-            action_expert.blocks[source_start_layer - 1:source_end_layer]
+        self.blocks = (
+            nn.ModuleList()
+            if zero_block_branch
+            else copy.deepcopy(
+                action_expert.blocks[source_start_layer - 1:source_end_layer]
+            )
         )
         self.head = copy.deepcopy(action_expert.head)
 
@@ -135,7 +143,12 @@ class DeepCopyInternalActionBranch(nn.Module):
         self.eval()
 
     def extra_repr(self) -> str:
+        source = (
+            "none"
+            if len(self.blocks) == 0
+            else f"{self.source_start_layer}..{self.source_end_layer}"
+        )
         return (
             f"fork_layer={self.fork_layer}, "
-            f"source_layers={self.source_start_layer}..{self.source_end_layer}"
+            f"source_layers={source}"
         )

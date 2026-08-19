@@ -473,13 +473,13 @@ def _predict_action_chunk(
             "internal_lora_checkpoint", None
         )
         infer_kwargs["internal_lora_fork_layer"] = int(
-            cfg.EVALUATION.get("internal_lora_fork_layer", 18)
+            cfg.EVALUATION.get("internal_lora_fork_layer", 4)
         )
         infer_kwargs["internal_lora_source_start_layer"] = int(
-            cfg.EVALUATION.get("internal_lora_source_start_layer", 19)
+            cfg.EVALUATION.get("internal_lora_source_start_layer", 30)
         )
         infer_kwargs["internal_lora_source_end_layer"] = int(
-            cfg.EVALUATION.get("internal_lora_source_end_layer", 24)
+            cfg.EVALUATION.get("internal_lora_source_end_layer", 30)
         )
         infer_kwargs["internal_lora_rank"] = int(
             cfg.EVALUATION.get("internal_lora_rank", 8)
@@ -515,6 +515,12 @@ def _predict_action_chunk(
         )
         infer_kwargs["dynamic_action_gap_anchor_action_gap"] = (
             None if dynamic_anchor_gap is None else int(dynamic_anchor_gap)
+        )
+        infer_kwargs["enable_oracle_action_gap"] = bool(
+            cfg.EVALUATION.get("enable_oracle_action_gap", False)
+        )
+        infer_kwargs["oracle_action_gap_threshold"] = float(
+            cfg.EVALUATION.get("oracle_action_gap_threshold", 0.36)
         )
         matched_mode = cfg.EVALUATION.get("compute_matched_action_gap_mode", None)
         infer_kwargs["compute_matched_action_gap_mode"] = (
@@ -581,6 +587,11 @@ def _predict_action_chunk(
         if chunk_metrics is None:
             chunk_metrics = {}
         chunk_metrics["dynamic_action_gap"] = dynamic_action_gap
+    oracle_action_gap = pred.get("oracle_action_gap")
+    if oracle_action_gap is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["oracle_action_gap"] = oracle_action_gap
     dynamic_action_gap_collection = pred.get("dynamic_action_gap_collection")
     if dynamic_action_gap_collection is not None:
         if chunk_metrics is None:
@@ -644,9 +655,11 @@ def run_single_episode(
         if reset_analysis is None:
             raise AttributeError("Model does not provide reset_c3cache_analysis().")
         reset_analysis()
-    if bool(cfg.EVALUATION.get("enable_dynamic_action_gap", False)) or cfg.EVALUATION.get(
-        "compute_matched_action_gap_mode", None
-    ) is not None:
+    if (
+        bool(cfg.EVALUATION.get("enable_dynamic_action_gap", False))
+        or bool(cfg.EVALUATION.get("enable_oracle_action_gap", False))
+        or cfg.EVALUATION.get("compute_matched_action_gap_mode", None) is not None
+    ):
         reset_dynamic_gate = getattr(model, "reset_dynamic_action_gap_state", None)
         if reset_dynamic_gate is None:
             raise AttributeError(
@@ -1138,9 +1151,9 @@ def eval_single_process(cfg: DictConfig):
     train_internal_lora = bool(cfg.EVALUATION.get("train_internal_lora", False))
     if train_internal_lora:
         audit = model.configure_internal_lora_branch(
-            fork_layer=int(cfg.EVALUATION.get("internal_lora_fork_layer", 18)),
-            source_start_layer=int(cfg.EVALUATION.get("internal_lora_source_start_layer", 19)),
-            source_end_layer=int(cfg.EVALUATION.get("internal_lora_source_end_layer", 24)),
+            fork_layer=int(cfg.EVALUATION.get("internal_lora_fork_layer", 4)),
+            source_start_layer=int(cfg.EVALUATION.get("internal_lora_source_start_layer", 30)),
+            source_end_layer=int(cfg.EVALUATION.get("internal_lora_source_end_layer", 30)),
             lora_rank=int(cfg.EVALUATION.get("internal_lora_rank", 8)),
             lora_alpha=float(cfg.EVALUATION.get("internal_lora_alpha", 16.0)),
             learning_rate=float(cfg.EVALUATION.get("internal_lora_learning_rate", 1e-4)),
@@ -1290,7 +1303,7 @@ def eval_single_process(cfg: DictConfig):
                     cfg.EVALUATION.get("internal_lora_checkpoint", "")
                 ),
                 "fork_layer": int(
-                    cfg.EVALUATION.get("internal_lora_fork_layer", 18)
+                    cfg.EVALUATION.get("internal_lora_fork_layer", 4)
                 ),
                 "hidden_dim": int(model.action_expert.hidden_dim),
                 "samples": gate_samples,

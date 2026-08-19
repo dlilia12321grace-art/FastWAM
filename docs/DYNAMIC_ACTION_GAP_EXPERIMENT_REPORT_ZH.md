@@ -1,8 +1,10 @@
 # Dynamic ActionGap：基于中间隐藏状态的动态 Internal/Full 路由
 
 > 阶段性研究报告与论文实验路线图
-> 更新日期：2026-08-15
-> 当前状态：核心方案已实现，四个 LIBERO Suite 的初步跨任务验证已完成；关键消融与公平基线仍在补充。
+> 更新日期：2026-08-19
+> 当前状态：fork2_b0 已确定为最终 static architecture；t0.40 matched fixed/random 已完成；最低实验闭环结束，停止新增实验并进入写作。
+> **阅读提示：本文按时间保留完整实验演进，开头部分包含历史 fork4/v4 结论。当前唯一阶段结论以 `docs/CURRENT_STAGE_SNAPSHOT_ZH.md` 为准。**
+> **LingBot-VA 迁移实验单独记录于 `docs/LINGBOT_VA_TRANSFER_REPORT_ZH.md`，本文不混入其不同运行时的绝对耗时。**
 
 ## 1. 报告目的
 
@@ -18,7 +20,7 @@
 
 因此，本文档既记录已有结果，也作为后续实验、可视化和论文写作的统一框架。
 
-## 2. 当前核心结论
+## 2. 历史阶段结论（fork4_b1/v4，已被后续结构实验更新）
 
 截至目前，能够较稳妥地表述的结论是：
 
@@ -73,7 +75,7 @@ hidden+meta gate 当前验证集结果：
 | MAE | 0.01465 |
 | 初始验证阈值 | 0.24291 |
 
-### 3.3 最终候选配置
+### 3.3 历史 fork4 阶段候选配置
 
 当前主候选 `v4_t036`：
 
@@ -353,6 +355,181 @@ meta-only 跨任务评测完成后分三种情况解释：
 
 两个 baseline 均正确达到目标计算预算，且所有 smoke episode 成功。按两个 Suite 简单平均，v4 的 internal ratio 约为 `65.8%`，与 compute-matched baseline 接近；但 fixed65 的平均 denoise/infer 时间略低于 v4。该结果尚未显示 MLP 在 task0 上优于固定 65% 调度。由于每组只有 5 episodes，下一步需在冻结的 task1–9 上进行正式配对比较。
 
+## 8.6 Compute-matched baseline：Goal + Spatial task1–9
+
+冻结参数后，在未参与阈值选择的 task1–9 上完成 180 episodes/method 的相同计算预算比较：
+
+| 方法 | 成功率 | Denoise ms | Infer ms | Internal ratio |
+|---|---:|---:|---:|---:|
+| v4_t036（hidden+meta） | 172/180 | 144.57 | 214.92 | 64.91% |
+| fixed65 | 173/180 | 139.31 | 209.65 | 64.77% |
+| random65 | 172/180 | 139.43 | 209.38 | 64.78% |
+
+三种方法的 internal ratio 几乎完全对齐。相对 fixed65，v4 少成功 1 个 episode，且 denoise/infer 分别慢约 `3.8%/2.5%`；相对 random65，v4 成功数相同，denoise/infer 分别慢约 `3.7%/2.6%`。由于 full/internal 数量几乎相同，这一额外延迟与在线 hidden 特征处理、MLP 输出的逐步 `.item()` GPU→CPU 同步，以及动态 full 路径的分段前向开销一致；具体贡献仍需通过 gate-overhead profiling 或 route-replay 消融确认。
+
+因此，当前结果**不支持 hidden+meta MLP 已经改善闭环速度—成功率前沿**。它证明了 hidden state 能更准确回归 internal/full action gap，也表现出跨任务自适应路由，但这种离线预测优势尚未转化为优于同预算固定或随机调度的闭环收益。下一步应优先分析失败时刻、风险标签与路由切换，而不是直接扩大相同配置的评测规模。
+
+### 8.7 配对失败初析
+
+v4 与 fixed65 的 180 个配对 episode 中，171 个共同成功、1 个仅 v4 成功、2 个仅 fixed65 成功、6 个共同失败。具体分歧为：
+
+- v4 独有失败：task2 Spatial episode 3、task3 Goal episode 6；
+- v4 独有成功：task6 Goal episode 5；
+- 共同失败：task3 Goal episodes 3/5、task8 Goal episode 5、task8 Spatial episode 4、task9 Goal episodes 1/3。
+
+v4 独有失败的 internal ratio 分别为 `63.2%/64.8%`，并未表现为异常激进；共同失败覆盖 `60.5%–69.8%`，也没有单调关系。除 v4 救回的 task6 Goal episode 5 在 15 个 chunk 内完成外，其余失败均运行到 40 个 chunk，初步更像任务未完成/超时，而非早期控制崩溃。由于样本仅 9 个特殊 case，该观察只能用于选择视频和时间线案例，不能证明因果。
+
+在全部 180 个 v4 episode 上，成功组（172 个）的平均 internal ratio、predicted gap、predicted-risky rate 分别为 `64.55%/0.2557/5.45%`；失败组（8 个）分别为 `66.16%/0.2483/3.84%`。失败 episode 反而被 gate 判断得略“安全”，说明当前监督目标衡量的是 internal/full 动作差异，并不天然等价于任务失败风险。该比较仍受严重的 episode 长度混杂影响：成功组平均 10.83 chunks，而失败组全部为 40 chunks，因此需要固定前 10 chunks 以及按 task 配对后再解释。
+
+固定比较每个 episode 的前 10 chunks 后，成功/失败组的 internal ratio 为 `64.64%/66.75%`，predicted gap 为 `0.2541/0.2438`，predicted-risky rate 为 `5.36%/3.25%`；失败组仍被判断得更安全。失败 episode 的最后 10 chunks反而回到 `65.0%/0.2511/5.0%`，因此该现象不能简单归因于后期卡住导致画面静止。尚需在同一 task 内配对，以排除失败集中在少数困难 task 的混杂。
+
+按 task 分层后，上述总体趋势发生反转，说明存在明显的任务分布混杂：在出现失败的 5 个 task-suite 组合中，4 个组合的失败轨迹 predicted gap 更高，4 个组合的 predicted-risky rate 更高；失败轨迹的 internal ratio 在 4 个组合中更低、1 个持平。具体 `failure-success` 差值为：task2 Spatial `gap +0.0020/risky +0.0064`，task3 Goal `+0.0064/+0.0000`，task8 Goal `+0.0018/+0.0189`，task8 Spatial `-0.0004/+0.0023`，task9 Goal `+0.0014/+0.0063`。因此，gate 在同一任务内对困难/失败轨迹具有方向正确但幅度较弱的风险响应；不能根据未分层的总体均值断言标签与闭环风险错位。
+
+下一项关键诊断是 true-gap oracle：在线同时计算 internal/full 输出，用真实 action gap 在相同约 65% 预算下选择输出（只用于验证标签上限，不报告速度）。若 oracle 优于 fixed/random，问题主要在 gate 精度、阈值和在线实现；若 oracle 仍不优，则 action gap 本身不是足够强的控制重要性标签。
+
+True-gap oracle 已完成代码实现与 1-episode smoke。修复显式 step0 绕过 oracle 的问题后，每个 chunk 完整记录 10 steps，first/last/anchor 安全约束正常。使用已有 task0 Goal/Spatial true-gap 数据离线扫描 threshold，在 `max_internal_run=7, anchor=8` 下，`threshold=0.350` 得到 Goal `70.00%`、Spatial `57.18%`、加权总体 `65.28%` internal，最接近 65% compute-matched 目标。该阈值冻结后用于 held-out oracle 验证。
+
+在失败相关的 held-out task2/3/6/8/9（Goal + Spatial，共 100 episodes/method）上，full、fixed_gap4、oracle_t035 分别取得 `94/100、94/100、93/100`；internal ratio 分别为 `n/a、60.00%、59.12%`。Oracle 相对 fixed 配对救回 2 次、丢失 3 次，净少 1 次。task0 校准的 65.28% 没有跨任务保持，说明真实 gap 分布也存在明显 task shift。更重要的是，Oracle 比 fixed 使用更少 internal、即更多 full 计算，却仍未改善成功率。因此当前 normalized internal/full action MSE 即使被完美观测，也没有形成优于固定调度的闭环前沿；继续单纯提升 MLP 回归精度或扩大同配置 oracle 的价值较低。
+
+后续主线转向两部分：第一，系统研究 `fork layer × internal blocks` 的结构 Pareto，先寻找更好的 Early Exit 基础分支；第二，仅在更优结构上尝试与任务进度、动作波动、接触/夹爪阶段或 uncertainty 更相关的重要性目标，而不是继续把 action MSE gap 直接等同于控制风险。
+
+## 8.8 Fork layer × Internal blocks 分级结构筛选
+
+老师提出的二维结构网格为 `fork layer ∈ {2,4,8,12,16}`、`internal blocks ∈ {0,1,2,4}`，共 20 组。采用分级预算而不是直接完整训练 20 组：
+
+1. **Fork screening**：固定 1 个 internal block（复制 Action DiT 最后一层 layer 30 初始化），对 5 个 fork 各短训 20 updates；在 Goal/Spatial task0 各评测 5 episodes，记录参数、训练时间、best distillation loss、denoise/infer latency 和成功率。
+2. **Block screening**：从第一阶段选择 2–3 个 Pareto fork，再训练 blocks 0/1/2/4；多 block 分支统一复制主干末端并以 layer 30 结束（2 blocks=`29–30`，4 blocks=`27–30`），0 block 表示 fork hidden 直接接输出 head。
+3. **闭环验证**：只对 3–5 个 Pareto 候选扩大到 held-out tasks；最终候选再恢复 dynamic/importance routing。
+
+第一阶段 runner：`scripts/run_internal_architecture_sweep.sh`；汇总脚本：`scripts/summarize_internal_architecture_sweep.py`。runner 支持已有 checkpoint/result 自动跳过，可在中断后继续。
+
+第一阶段已完成（每个结构 Spatial task0 短训 20 updates，Goal/Spatial task0 各 5 episodes）：
+
+| Fork | Blocks | Params | Trainable | Best loss | Success | Denoise ms | Infer ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 33,951,751 | 351,239 | 0.220374 | 10/10 | 141.49 | 218.96 |
+| 4 | 1 | 33,951,751 | 351,239 | 0.220224 | 10/10 | 153.46 | 231.18 |
+| 8 | 1 | 33,951,751 | 351,239 | 0.224242 | 10/10 | 172.73 | 249.31 |
+| 12 | 1 | 33,951,751 | 351,239 | 0.180117 | 10/10 | 200.49 | 276.81 |
+| 16 | 1 | 33,951,751 | 351,239 | 0.108814 | 10/10 | 220.69 | 296.82 |
+
+所有配置均成功且参数量相同。fork2 与 fork4 的短训 loss 几乎相同，但 fork2 的 denoise/infer 分别再快约 `8.5%/5.6%`；fork12/16 显著降低蒸馏 loss，但延迟更高。进入 block screening 的主要 Pareto fork 为 `2/12/16`，保留 fork4 作为现有方法参照；fork8 在当前证据下被支配。
+
+第二阶段 block screening 也已完成。对 Pareto fork `2/12/16` 分别测试 `0/1/2/4` 个 internal blocks；所有结构沿用相同的 20-update 短训预算，并在 Goal/Spatial task0 各评测 5 episodes。完整结果如下：
+
+| Fork | Blocks | Params | Trainable | Best loss | Success | Denoise ms | Infer ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 0 | 7,175 | 7,175 | 0.218796 | 10/10 | 132.17 | 206.11 |
+| 2 | 1 | 33,951,751 | 351,239 | 0.220374 | 10/10 | 141.49 | 218.96 |
+| 2 | 2 | 67,896,327 | 695,303 | 0.226445 | 10/10 | 146.00 | 221.69 |
+| 2 | 4 | 135,785,479 | 1,383,431 | 0.178154 | 10/10 | 160.77 | 237.82 |
+| 12 | 0 | 7,175 | 7,175 | 0.161806 | 10/10 | 193.00 | 267.71 |
+| 12 | 1 | 33,951,751 | 351,239 | 0.180117 | 10/10 | 200.49 | 276.81 |
+| 12 | 2 | 67,896,327 | 695,303 | 0.149548 | 10/10 | 204.26 | 279.03 |
+| 12 | 4 | 135,785,479 | 1,383,431 | 0.074430 | 10/10 | 218.44 | 294.67 |
+| 16 | 0 | 7,175 | 7,175 | 0.127024 | 10/10 | 215.14 | 289.82 |
+| 16 | 1 | 33,951,751 | 351,239 | 0.108814 | 10/10 | 220.69 | 296.82 |
+| 16 | 2 | 67,896,327 | 695,303 | 0.062143 | 10/10 | 227.68 | 303.56 |
+| 16 | 4 | 135,785,479 | 1,383,431 | 0.030502 | 10/10 | 236.95 | 313.02 |
+
+当前最重要的 screening finding 是 `fork2_b0`：它只训练输出 head，共 `7,175` 个参数；相对现有参考 `fork4_b1` 的 `351,239` 个可训练参数减少约 `49x`，denoise 从 `153.46` 降至 `132.17 ms`（约 `1.16x`），infer 从 `231.18` 降至 `206.11 ms`（约 `1.12x`），同时短训 loss 基本持平且均为 `10/10`。这初步支持“浅层 hidden 可直接预测动作、额外 internal block 未必必要”的结构故事。
+
+结构趋势不能简单概括为 blocks 越多越好：后移 fork、增加容量总体可降低最低蒸馏 loss，但每个局部配置并非严格单调；例如 fork2/fork12 的 0-block loss 不差于 1-block。所有配置在 task0 小样本上均为 `10/10`，成功率已经饱和，因此这些数据只用于候选筛选，不能证明 `fork2_b0` 已在闭环上最终最优。
+
+进入正式验证的代表点为：`fork2_b0`（效率端）、`fork2_b4`（早 fork/高容量）、`fork12_b0`（极小参数/更低 loss）、`fork16_b4`（最低 loss 上界），并保留 `fork4_b1` 作为现有方法参照。下一阶段先统一正式训练，再在 held-out LIBERO tasks 上分级闭环筛选；只有通过跨任务验证的结构才重新接入 dynamic/importance router。
+
+### 8.8.1 Pareto 候选正式训练与 held-out pilot
+
+五个代表结构已统一增加到 100 training updates，并在 held-out task1–4 的 Goal/Spatial 上各运行 5 episodes，共 40 episodes/结构。结果如下：
+
+| Method | Trainable | Best loss | Success | Denoise ms | Infer ms | Internal ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| fork2_b0 | 7,175 | 0.218796 | 39/40 | 134.71 | 208.56 | 60.0% |
+| fork2_b4 | 1,383,431 | 0.073072 | 40/40 | 158.81 | 235.38 | 60.0% |
+| fork12_b0 | 7,175 | 0.125203 | 39/40 | 191.93 | 265.25 | 60.0% |
+| fork16_b4 | 1,383,431 | 0.007514 | 39/40 | 241.69 | 319.11 | 60.0% |
+| fork4_b1（reference） | 351,239 | 0.220224 | 39/40 | 152.57 | 228.18 | 60.0% |
+
+四个 39/40 结构均只在 task3 Goal episode 3 失败；`fork2_b4` 在该 episode 成功，因此取得 40/40。该单 episode 差异不足以证明成功率提升，但可将 fork2_b4 保留为 quality candidate。`fork2_b0` 与参考结构成功集合完全一致，同时参数减少约 `49x`、denoise 加速 `1.133x`、infer 加速 `1.094x`，是当前最强 efficiency candidate。
+
+`fork12_b0` 与 fork2_b0 参数和成功率相同但显著更慢；`fork16_b4` 与 fork2_b4 参数相同但更慢且少成功 1 次。二者较低的离线 loss 没有在该 pilot 中转化为闭环优势，因此不进入下一阶段。task1–9、Goal/Spatial、10 episodes 的正式配对验证只保留 `fork2_b0、fork2_b4、fork4_b1`。
+
+### 8.8.2 task1–9 正式跨任务结构验证
+
+在 task1–9 的 Goal/Spatial 上完成 10 episodes/task-suite，共 180 episodes/结构：
+
+| Method | Success | Denoise ms | Infer ms | Internal ratio | Trainable |
+|---|---:|---:|---:|---:|---:|
+| fork2_b0 | **172/180** | **134.01** | **203.27** | 60.0% | **7,175** |
+| fork2_b4 | 171/180 | 158.22 | 229.12 | 60.0% | 1,383,431 |
+| fork4_b1（reference） | 171/180 | 152.53 | 222.86 | 60.0% | 351,239 |
+
+`fork2_b0` 相对 `fork4_b1` 在相同 60% internal ratio 下，成功总数多 1 次（`+0.56 pp`，只作为观察值，不声称显著提升），denoise 加速 `1.138x`，infer 加速 `1.096x`，可训练参数减少约 `49x`。因此它在当前闭环证据中同时改善成功数、延迟和参数成本，是最终的 static internal architecture candidate。
+
+`fork2_b4` 的训练 loss 显著更低，但成功数与 reference 相同且延迟更高、参数更多，说明离线蒸馏 loss 不能单独作为结构选择标准。多-block 路线停止扩大；后续只需补充 fork2_b0 在 Object/LIBERO-10 上的结构泛化，并在 fork2_b0 上重新收集 gap/hidden 数据、训练 dynamic router 与 compute-matched baselines。
+
+### 8.8.3 Object/LIBERO-10 结构泛化与最终选择
+
+在 Object 和 LIBERO-10 的 task0–9 上完成 10 episodes/task-suite，共 200 episodes/结构：
+
+| Method | Success | Denoise ms | Infer ms | Internal ratio | Trainable |
+|---|---:|---:|---:|---:|---:|
+| fork2_b0 | **196/200** | **133.59** | **201.05** | 60.0% | **7,175** |
+| fork4_b1（reference） | 193/200 | 151.02 | 219.14 | 60.0% | 351,239 |
+
+配对结果中 fork2_b0 独有成功 5 次、reference 独有成功 2 次、共同失败 2 次，净多成功 3 次。该差异仍不表述为统计显著提升，但至少没有出现用速度换成功率的迹象。
+
+合并 Goal/Spatial 的 180 episodes 与 Object/LIBERO-10 的 200 episodes 后，fork2_b0 与 fork4_b1 分别为 `368/380` 和 `364/380`；episode 加权 denoise 为 `133.79/151.74 ms`，infer 为 `202.10/220.90 ms`。fork2_b0 相对 reference 成功率观察值 `+1.05 pp`，denoise 加速约 `1.134x`，infer 加速约 `1.093x`，可训练参数减少约 `49x`。据此正式选择 `fork2_b0` 作为 FastWAM 的最终 static internal early-exit architecture；后续动态路由、matched baseline、可视化和稳定性实验全部基于该结构重做。
+
+为保证新旧 dynamic router 的因果比较，下一步首先保持原 task0 Goal/Spatial 数据采集与训练协议不变，只将 internal architecture 从 fork4_b1 替换为 fork2_b0；重新采集真实 internal/full gap、训练 hidden+meta gate，并使用 checkpoint 自带的重新校准阈值完成 smoke。旧 fork4_b1 gate 的 `0.36` 阈值不直接复用，因为 branch 改变后 gap 分布与量纲可能变化。runner 已将 fork/source range/rank/alpha 改为显式环境参数；fork2_b0 使用 `fork=2, source_start=30, source_end=29`。
+
+### 8.8.4 fork2_b0 Dynamic gate 初次跨任务结果
+
+基于 fork2_b0 重新采集 task0 Goal/Spatial gap/hidden 数据并训练 hidden+meta gate 后，使用 checkpoint 自带阈值，在 held-out task1–9 Goal/Spatial 上完成 180 episodes/method：
+
+| Method | Success | Denoise ms | Infer ms | Internal ratio |
+|---|---:|---:|---:|---:|
+| fork2_b0 fixed gap4 | 172/180 | 133.40 | 202.75 | 60.0% |
+| fork2_b0 dynamic（default threshold） | **176/180** | 190.84 | 260.60 | 40.7% |
+
+配对上 dynamic-only=5、fixed-only=1、both-fail=3，净多成功 4 次；exact McNemar 双侧检验约为 `p=0.219`，不能声称统计显著。更重要的是，dynamic 的 internal ratio 从 60.0% 降到 40.7%，即使用了明显更多 full computation；相对 fixed 的 denoise/infer 比值为 `0.699x/0.778x`（分别约慢 43%/29%）。因此该结果只能说明保守动态策略形成了一个可能的 quality-first Pareto 点，不能证明 learned routing 在同算力下优于 fixed。
+
+下一步必须先完成两类控制：第一，在约 40.7% internal ratio 下运行 compute-matched fixed/random，判断 176/180 是否来自 learned selection 而非单纯增加 full steps；第二，使用 fork2_b0 gate 进行 threshold/安全约束扫描，获得约 50%/60%/65% internal 的 speed-success frontier。还应补同一 seeds/timing 的 full baseline，判断保守 dynamic 是否在成功数与 full-compute 之间形成有效 Pareto 点。
+
+使用 held-out 预测分布诊断后发现，checkpoint 阈值 `0.2568` 接近预测分数 q60，但 first/last/max-run 与 predicted-risky 共同将在线 internal ratio 压到 40.7%。将安全约束改为 `max_internal_run=7, anchor=8`，在 task0 Goal/Spatial 各 5 episodes 上扫描阈值：
+
+| Threshold | Goal success/internal | Spatial success/internal | Mean denoise ms | Mean infer ms |
+|---:|---:|---:|---:|---:|
+| fixed gap4 | 5/5 / 60.0% | 5/5 / 60.0% | 134.01 | 209.08 |
+| default 0.2568 | 5/5 / 44.8% | 5/5 / 37.4% | 188.09 | 262.21 |
+| 0.30 | 5/5 / 60.0% | 5/5 / 60.0% | 136.64 | 211.18 |
+| 0.35 | 5/5 / 63.9% | 5/5 / 60.0% | 134.34 | 210.42 |
+| 0.40 | **5/5 / 68.4%** | **5/5 / 66.9%** | **117.28** | **191.54** |
+
+阈值 0.30 在计算量和延迟上基本退化为 fixed；0.35 是约 60–64% internal 的 balanced/同算力候选；0.40 是约 67–68% internal 的 speed-first 候选，在该 10-episode smoke 中保持 10/10，并相对 fixed 平均 denoise/infer 加速约 `1.143x/1.092x`。下一步只扩大 0.35 与 0.40，不再测试 0.30；待 held-out 结果后分别配置实际 internal ratio 匹配的 fixed/random baseline。
+
+task1–9 Goal/Spatial 的 180-episode 阈值验证已完成：
+
+| Method | Success | Denoise ms | Infer ms | Internal ratio |
+|---|---:|---:|---:|---:|
+| fixed gap4 | 172/180 | 133.40 | 202.75 | 60.0% |
+| fork2_b0 t0.35 | **174/180** | 135.43 | 204.95 | 61.1% |
+| fork2_b0 t0.40 | 172/180 | **114.28** | **183.40** | 68.5% |
+
+t0.35 是 quality/balanced 点：观察到多成功 2 次，但当前 wall-clock 略慢于 fixed；t0.40 是 speed-first 点：成功总数与 fixed 完全相同，配对 dynamic-only/fixed-only 均为 2，并取得 `1.167x` denoise、`1.106x` infer 加速。两者分别需要 61.1% 和 68.5% internal 的 fixed/random matched baselines，才能判断收益来自 learned route 还是不同的计算预算/执行形态。
+
+t0.40 的 68.5% compute-matched 验证已完成：
+
+| Method | Success | Denoise ms | Infer ms | Internal ratio |
+|---|---:|---:|---:|---:|
+| fork2_b0 t0.40 | 172/180 | 114.28 | 183.40 | 68.5% |
+| fixed685 | 171/180 | **112.70** | 182.44 | 68.1% |
+| random685 | 172/180 | **112.69** | **182.12** | 68.1% |
+
+t0.40 与 random685 成功数完全相同，但 denoise/infer 约慢 `1.4%/0.7%`；相对 fixed685 多成功 1 次，但也约慢 `1.4%/0.5%`。0.4 pp internal-ratio 差异很小，不改变结论：当前 hidden+meta MLP 没有优于同算力 fixed/random routing。其相对 fixed gap4 的 1.167x/1.106x 增量加速主要来自把 internal ratio 从 60.0% 提高到约 68%，而不是 learned importance 的独特选步能力。
+
+至此最低实验闭环完成。论文正面主结果应是 fork2_b0 architecture：在四 Suite 上以约 49x 更少可训练参数和约 1.13x/1.09x 延迟改进保持或提高成功数观察值；MLP 部分应诚实报告为可形成 quality/speed threshold frontier，但未击败 compute-matched state-independent schedules。除非重新设计与控制风险更相关的 supervision，否则不继续扩大当前 gap-regression router。
+
 ## 9. 必须补充的实验
 
 ### P0：形成可信核心结论
@@ -361,9 +538,10 @@ meta-only 跨任务评测完成后分三种情况解释：
 |---|---|---|---|
 | Meta-only task1–9 | 判断是否只学到 timestep schedule | 与 v4 使用相同任务/seeds，报告成功率、速度、internal ratio | 已完成：173/180，70.0% internal |
 | Meta-only Object/10 | 验证四个 Suite 的泛化 | task0–9，至少 200 episodes | 待运行 |
-| Compute-matched fixed | 排除“只是跳得更多” | internal ratio 与 dynamic 约 65% 对齐 | 已实现，待闭环评测 |
-| Compute-matched random | 验证 importance routing 优于随机分配 | 使用相同 full/internal 数量和安全约束 | 已实现，待闭环评测 |
+| Compute-matched fixed | 排除“只是跳得更多” | internal ratio 与 dynamic 约 65% 对齐 | 已完成：173/180，64.77% internal |
+| Compute-matched random | 验证 importance routing 优于随机分配 | 使用相同 full/internal 数量和安全约束 | 已完成：172/180，64.78% internal |
 | Full 精确总表 | 回答最终总推理加速 | 四个 Suite 均报告成功率和绝对 timing | 部分完成 |
+| Pareto 架构正式验证 | 判断 task0 screening 是否跨任务成立 | 五个代表结构统一训练；held-out tasks 配对成功率、速度和参数成本 | 已完成；fork2_b0 入选 |
 
 ### P1：把故事讲完整
 

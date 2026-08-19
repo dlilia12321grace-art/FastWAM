@@ -274,3 +274,59 @@ def test_fastwam_wires_anchor_to_router_not_metadata_builder():
     assert "anchor_action_gap" in keywords_by_call[
         "select_dynamic_action_gap_route"
     ]
+
+
+def test_fastwam_true_gap_oracle_routes_with_oracle_score():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "fastwam"
+        / "models"
+        / "wan22"
+        / "fastwam.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    infer_action = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "infer_action"
+    )
+    argument_names = {argument.arg for argument in infer_action.args.args}
+    assert "enable_oracle_action_gap" in argument_names
+    assert "oracle_action_gap_threshold" in argument_names
+
+    oracle_router_calls = []
+    for node in ast.walk(infer_action):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "select_dynamic_action_gap_route":
+            continue
+        predicted_gap = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "predicted_gap"),
+            None,
+        )
+        if isinstance(predicted_gap, ast.Name) and predicted_gap.id == "oracle_score":
+            oracle_router_calls.append(node)
+    assert len(oracle_router_calls) == 1
+
+    oracle_guard = next(
+        node
+        for node in ast.walk(infer_action)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "enable_oracle_action_gap"
+    )
+    clears_explicit_steps = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "internal_lora_inference_steps_set"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "set"
+        for node in ast.walk(oracle_guard)
+    )
+    assert clears_explicit_steps

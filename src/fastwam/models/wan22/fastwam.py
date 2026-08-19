@@ -202,9 +202,9 @@ class FastWAM(torch.nn.Module):
 
     def configure_internal_lora_branch(
         self,
-        fork_layer: int = 18,
-        source_start_layer: int = 19,
-        source_end_layer: int = 24,
+        fork_layer: int = 4,
+        source_start_layer: int = 30,
+        source_end_layer: int = 30,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         learning_rate: float = 1e-4,
@@ -1239,9 +1239,9 @@ class FastWAM(torch.nn.Module):
         internal_lora_max_updates: Optional[int] = None,
         enable_internal_lora_branch: bool = False,
         internal_lora_checkpoint: Optional[str] = None,
-        internal_lora_fork_layer: int = 18,
-        internal_lora_source_start_layer: int = 19,
-        internal_lora_source_end_layer: int = 24,
+        internal_lora_fork_layer: int = 4,
+        internal_lora_source_start_layer: int = 30,
+        internal_lora_source_end_layer: int = 30,
         internal_lora_rank: int = 8,
         internal_lora_alpha: float = 16.0,
         internal_lora_inference_steps: tuple[int, ...] = (0,),
@@ -1253,6 +1253,8 @@ class FastWAM(torch.nn.Module):
         dynamic_action_gap_threshold: Optional[float] = None,
         dynamic_action_gap_max_internal_run: int = 3,
         dynamic_action_gap_anchor_action_gap: Optional[int] = None,
+        enable_oracle_action_gap: bool = False,
+        oracle_action_gap_threshold: float = 0.36,
         compute_matched_action_gap_mode: Optional[str] = None,
         compute_matched_action_gap_target_internal_ratio: float = 0.65,
         compute_matched_action_gap_seed: int = 0,
@@ -1464,7 +1466,12 @@ class FastWAM(torch.nn.Module):
             else str(compute_matched_action_gap_mode).strip().lower()
         )
         if collect_dynamic_action_gap_data:
-            if enable_dynamic_action_gap or enable_action_gap_schedule or compute_matched_mode:
+            if (
+                enable_dynamic_action_gap
+                or enable_oracle_action_gap
+                or enable_action_gap_schedule
+                or compute_matched_mode
+            ):
                 raise ValueError(
                     "Dynamic ActionGap data collection must run the full teacher path."
                 )
@@ -1477,6 +1484,7 @@ class FastWAM(torch.nn.Module):
             bool(mode)
             for mode in (
                 enable_dynamic_action_gap,
+                enable_oracle_action_gap,
                 enable_action_gap_schedule,
                 compute_matched_mode,
             )
@@ -1485,6 +1493,19 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 "Dynamic, fixed ActionGap, and compute-matched routing are mutually exclusive."
             )
+        if enable_oracle_action_gap:
+            if not enable_internal_lora_branch:
+                raise ValueError(
+                    "True-gap oracle routing requires Internal LoRA inference."
+                )
+            if oracle_action_gap_threshold < 0:
+                raise ValueError("`oracle_action_gap_threshold` must be non-negative.")
+            if dynamic_action_gap_max_internal_run <= 0:
+                raise ValueError("`dynamic_action_gap_max_internal_run` must be positive.")
+            # The oracle chooses every denoising route after observing both outputs.
+            # Do not let the legacy explicit step list bypass the oracle (the
+            # default list contains step 0).
+            internal_lora_inference_steps_set = set()
         if enable_dynamic_action_gap:
             if not enable_internal_lora_branch:
                 raise ValueError(
@@ -1584,11 +1605,12 @@ class FastWAM(torch.nn.Module):
             )
             if dynamic_action_gap_effective_threshold is None:
                 raise ValueError("Dynamic ActionGap threshold is unavailable.")
-        if collect_dynamic_action_gap_data:
+        if collect_dynamic_action_gap_data or enable_oracle_action_gap:
             captured_layers.add(self.internal_lora_branch.fork_layer)
         internal_lora_used_steps: list[int] = []
         internal_lora_step_modes: list[str] = []
         dynamic_action_gap_steps: list[dict[str, Any]] = []
+        oracle_action_gap_steps: list[dict[str, Any]] = []
         dynamic_steps_since_full = 0
         if train_internal_lora and (
             self.internal_lora_branch is None or self._internal_lora_optimizer is None
@@ -1635,7 +1657,11 @@ class FastWAM(torch.nn.Module):
                 enable_internal_lora_branch
                 and step_idx in internal_lora_inference_steps_set
             )
-            if enable_internal_lora_branch and not enable_dynamic_action_gap:
+            if (
+                enable_internal_lora_branch
+                and not enable_dynamic_action_gap
+                and not enable_oracle_action_gap
+            ):
                 internal_lora_step_modes.append(
                     "internal" if use_internal_lora else "full"
                 )
@@ -1799,6 +1825,7 @@ class FastWAM(torch.nn.Module):
                         or collect_internal_distillation
                         or train_internal_lora
                         or collect_dynamic_action_gap_data
+                        or enable_oracle_action_gap
                     ),
                     capture_layers=captured_layers or None,
                 )
@@ -1809,6 +1836,7 @@ class FastWAM(torch.nn.Module):
                     or collect_internal_distillation
                     or train_internal_lora
                     or collect_dynamic_action_gap_data
+                    or enable_oracle_action_gap
                 ):
                     pred_action_posi, intermediates = prediction
                     if collect_internal_distillation:
@@ -1830,7 +1858,7 @@ class FastWAM(torch.nn.Module):
                                 },
                             }
                         )
-                    if collect_dynamic_action_gap_data:
+                    if collect_dynamic_action_gap_data or enable_oracle_action_gap:
                         branch = self.internal_lora_branch
                         branch_input_layer = branch.fork_layer
                         fork_hidden = intermediates["captured_tokens"][branch_input_layer]
@@ -1854,18 +1882,48 @@ class FastWAM(torch.nn.Module):
                             (internal_prediction.float() - teacher_float).square().mean()
                             / teacher_float.square().mean().clamp_min(1e-12)
                         )
-                        self._dynamic_action_gap_samples.append({
-                            "chunk_index": int(
-                                self._dynamic_action_gap_collection_chunk_index
-                            ),
-                            "step_index": int(step_idx),
-                            "num_steps": int(len(infer_timesteps_action)),
-                            "timestep": float(step_t_action.item()),
-                            "pooled_hidden": fork_hidden.mean(dim=1)
-                            .detach()
-                            .to(device="cpu", dtype=torch.bfloat16),
-                            "gap": float(normalized_gap.detach().cpu()),
-                        })
+                        if enable_oracle_action_gap:
+                            oracle_score = float(
+                                torch.log1p(normalized_gap).detach().cpu()
+                            )
+                            route, route_reason = select_dynamic_action_gap_route(
+                                predicted_gap=oracle_score,
+                                threshold=float(oracle_action_gap_threshold),
+                                step_index=step_idx,
+                                num_steps=len(infer_timesteps_action),
+                                steps_since_full=dynamic_steps_since_full,
+                                max_internal_run=dynamic_action_gap_max_internal_run,
+                                anchor_action_gap=dynamic_action_gap_anchor_action_gap,
+                            )
+                            if route == "internal":
+                                pred_action_posi = internal_prediction
+                                internal_lora_used_steps.append(step_idx)
+                                dynamic_steps_since_full += 1
+                            else:
+                                dynamic_steps_since_full = 0
+                            internal_lora_step_modes.append(route)
+                            oracle_action_gap_steps.append({
+                                "step": int(step_idx),
+                                "timestep": float(step_t_action.item()),
+                                "true_gap": float(normalized_gap.detach().cpu()),
+                                "oracle_score": oracle_score,
+                                "threshold": float(oracle_action_gap_threshold),
+                                "route": route,
+                                "reason": route_reason,
+                            })
+                        if collect_dynamic_action_gap_data:
+                            self._dynamic_action_gap_samples.append({
+                                "chunk_index": int(
+                                    self._dynamic_action_gap_collection_chunk_index
+                                ),
+                                "step_index": int(step_idx),
+                                "num_steps": int(len(infer_timesteps_action)),
+                                "timestep": float(step_t_action.item()),
+                                "pooled_hidden": fork_hidden.mean(dim=1)
+                                .detach()
+                                .to(device="cpu", dtype=torch.bfloat16),
+                                "gap": float(normalized_gap.detach().cpu()),
+                            })
                     update_budget_available = (
                         internal_lora_max_updates is None
                         or self._internal_lora_updates < internal_lora_max_updates
@@ -2039,6 +2097,8 @@ class FastWAM(torch.nn.Module):
                 "schedule_type": (
                     "dynamic_action_gap"
                     if enable_dynamic_action_gap
+                    else "oracle_action_gap"
+                    if enable_oracle_action_gap
                     else f"compute_matched_{compute_matched_mode}"
                     if compute_matched_mode
                     else "action_gap"
@@ -2068,6 +2128,20 @@ class FastWAM(torch.nn.Module):
                         else int(dynamic_action_gap_anchor_action_gap)
                     ),
                     "steps": dynamic_action_gap_steps,
+                }
+                self._dynamic_action_gap_chunk_index += 1
+            elif enable_oracle_action_gap:
+                result["oracle_action_gap"] = {
+                    "chunk_index": int(self._dynamic_action_gap_chunk_index),
+                    "threshold": float(oracle_action_gap_threshold),
+                    "score": "log1p(normalized_internal_full_mse)",
+                    "max_internal_run": int(dynamic_action_gap_max_internal_run),
+                    "anchor_action_gap": (
+                        None
+                        if dynamic_action_gap_anchor_action_gap is None
+                        else int(dynamic_action_gap_anchor_action_gap)
+                    ),
+                    "steps": oracle_action_gap_steps,
                 }
                 self._dynamic_action_gap_chunk_index += 1
             elif compute_matched_mode:

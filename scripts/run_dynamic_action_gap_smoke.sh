@@ -16,6 +16,11 @@ FASTWAM_PYTHON="${FASTWAM_PYTHON:-/root/autodl-tmp/envs/fastwam/bin/python}"
 FASTWAM_CKPT="${FASTWAM_CKPT:-/root/autodl-tmp/checkpoints/fastwam_release/libero_uncond_2cam224.pt}"
 FASTWAM_STATS="${FASTWAM_STATS:-/root/autodl-tmp/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json}"
 INTERNAL_LORA_CKPT="${INTERNAL_LORA_CKPT:-/root/autodl-tmp/checkpoints/shallow_fork4_copy30_train20.best.pt}"
+INTERNAL_LORA_FORK_LAYER="${INTERNAL_LORA_FORK_LAYER:-4}"
+INTERNAL_LORA_SOURCE_START_LAYER="${INTERNAL_LORA_SOURCE_START_LAYER:-30}"
+INTERNAL_LORA_SOURCE_END_LAYER="${INTERNAL_LORA_SOURCE_END_LAYER:-30}"
+INTERNAL_LORA_RANK="${INTERNAL_LORA_RANK:-8}"
+INTERNAL_LORA_ALPHA="${INTERNAL_LORA_ALPHA:-16.0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/evaluate_results/dynamic_action_gap_smoke}"
 NUM_TRIALS="${NUM_TRIALS:-5}"
 GATE_EPOCHS="${GATE_EPOCHS:-30}"
@@ -26,6 +31,10 @@ DYNAMIC_MAX_INTERNAL_RUN="${DYNAMIC_MAX_INTERNAL_RUN:-7}"
 DYNAMIC_ANCHOR_ACTION_GAP="${DYNAMIC_ANCHOR_ACTION_GAP:-8}"
 MATCHED_TARGET_INTERNAL_RATIO="${MATCHED_TARGET_INTERNAL_RATIO:-0.65}"
 MATCHED_RANDOM_SEED="${MATCHED_RANDOM_SEED:-20260815}"
+MATCHED_FIXED_METHOD="${MATCHED_FIXED_METHOD:-fixed65}"
+MATCHED_RANDOM_METHOD="${MATCHED_RANDOM_METHOD:-random65}"
+ORACLE_METHOD="${ORACLE_METHOD:-oracle_t036}"
+ORACLE_THRESHOLD="${ORACLE_THRESHOLD:-0.36}"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
@@ -60,11 +69,11 @@ base_args=(
 internal_args=(
   EVALUATION.enable_internal_lora_branch=true
   "EVALUATION.internal_lora_checkpoint=${INTERNAL_LORA_CKPT}"
-  EVALUATION.internal_lora_fork_layer=4
-  EVALUATION.internal_lora_source_start_layer=30
-  EVALUATION.internal_lora_source_end_layer=30
-  EVALUATION.internal_lora_rank=8
-  EVALUATION.internal_lora_alpha=16.0
+  "EVALUATION.internal_lora_fork_layer=${INTERNAL_LORA_FORK_LAYER}"
+  "EVALUATION.internal_lora_source_start_layer=${INTERNAL_LORA_SOURCE_START_LAYER}"
+  "EVALUATION.internal_lora_source_end_layer=${INTERNAL_LORA_SOURCE_END_LAYER}"
+  "EVALUATION.internal_lora_rank=${INTERNAL_LORA_RANK}"
+  "EVALUATION.internal_lora_alpha=${INTERNAL_LORA_ALPHA}"
 )
 
 common_args=("${base_args[@]}" "${internal_args[@]}")
@@ -113,6 +122,11 @@ run_train_meta_only() {
 
 run_fixed_eval() {
   local suite="$1"
+  local result="${OUTPUT_ROOT}/fixed_gap4_${suite}/${suite}/gpu0_task${TASK_ID}_results.json"
+  if [[ -f "$result" ]]; then
+    echo "[skip fixed] task${TASK_ID} $suite: $result already exists"
+    return
+  fi
   "$FASTWAM_PYTHON" experiments/libero/eval_libero_single.py \
     "${common_args[@]}" \
     "EVALUATION.task_suite_name=${suite}" \
@@ -138,6 +152,11 @@ run_full_eval() {
 run_dynamic_eval() {
   local suite="$1"
   require_file "$GATE_CKPT"
+  local result="${OUTPUT_ROOT}/dynamic_${suite}/${suite}/gpu0_task${TASK_ID}_results.json"
+  if [[ -f "$result" ]]; then
+    echo "[skip dynamic] task${TASK_ID} $suite: $result already exists"
+    return
+  fi
   "$FASTWAM_PYTHON" experiments/libero/eval_libero_single.py \
     "${common_args[@]}" \
     "EVALUATION.task_suite_name=${suite}" \
@@ -219,6 +238,11 @@ run_compute_matched_eval() {
   local suite="$1"
   local method="$2"
   local mode="$3"
+  local result="${OUTPUT_ROOT}/${method}_${suite}/${suite}/gpu0_task${TASK_ID}_results.json"
+  if [[ -f "$result" ]]; then
+    echo "[skip matched] task${TASK_ID} $method $suite"
+    return
+  fi
   "$FASTWAM_PYTHON" experiments/libero/eval_libero_single.py \
     "${common_args[@]}" \
     "EVALUATION.task_suite_name=${suite}" \
@@ -236,9 +260,53 @@ run_compute_matched_eval() {
 run_compute_matched() {
   local suite
   for suite in $CROSS_SUITES; do
-    run_compute_matched_eval "$suite" fixed65 fixed
-    run_compute_matched_eval "$suite" random65 random
+    run_compute_matched_eval "$suite" "$MATCHED_FIXED_METHOD" fixed
+    run_compute_matched_eval "$suite" "$MATCHED_RANDOM_METHOD" random
   done
+}
+
+run_oracle_eval() {
+  local suite="$1"
+  "$FASTWAM_PYTHON" experiments/libero/eval_libero_single.py \
+    "${common_args[@]}" \
+    "EVALUATION.task_suite_name=${suite}" \
+    "EVALUATION.output_dir=${OUTPUT_ROOT}/${ORACLE_METHOD}_${suite}" \
+    EVALUATION.collect_dynamic_action_gap_data=false \
+    EVALUATION.enable_action_gap_schedule=false \
+    EVALUATION.enable_dynamic_action_gap=false \
+    EVALUATION.enable_oracle_action_gap=true \
+    "EVALUATION.oracle_action_gap_threshold=${ORACLE_THRESHOLD}" \
+    "EVALUATION.dynamic_action_gap_max_internal_run=${DYNAMIC_MAX_INTERNAL_RUN}" \
+    "EVALUATION.dynamic_action_gap_anchor_action_gap=${DYNAMIC_ANCHOR_ACTION_GAP}"
+}
+
+run_oracle() {
+  local suite
+  for suite in $CROSS_SUITES; do
+    run_oracle_eval "$suite"
+  done
+}
+
+run_oracle_cross_task_validation() {
+  local task_id
+  for task_id in $CROSS_TASK_IDS; do
+    echo "=== True-gap oracle: task ${task_id} ==="
+    TASK_ID="$task_id" \
+    NUM_TRIALS="$CROSS_NUM_TRIALS" \
+    CROSS_SUITES="$CROSS_SUITES" \
+    OUTPUT_ROOT="${OUTPUT_ROOT}/task${task_id}" \
+    ORACLE_METHOD="$ORACLE_METHOD" \
+    ORACLE_THRESHOLD="$ORACLE_THRESHOLD" \
+    DYNAMIC_MAX_INTERNAL_RUN="$DYNAMIC_MAX_INTERNAL_RUN" \
+    DYNAMIC_ANCHOR_ACTION_GAP="$DYNAMIC_ANCHOR_ACTION_GAP" \
+      bash "$0" oracle
+  done
+  "$FASTWAM_PYTHON" scripts/summarize_dynamic_action_gap_cross_task.py \
+    "$OUTPUT_ROOT" \
+    --task-ids $CROSS_TASK_IDS \
+    --suites $CROSS_SUITES \
+    --dynamic-method "$ORACLE_METHOD" \
+    --json-output "${OUTPUT_ROOT}/cross_task_summary_${ORACLE_METHOD}.json"
 }
 
 run_compute_matched_cross_task_validation() {
@@ -251,11 +319,13 @@ run_compute_matched_cross_task_validation() {
     OUTPUT_ROOT="${OUTPUT_ROOT}/task${task_id}" \
     MATCHED_TARGET_INTERNAL_RATIO="$MATCHED_TARGET_INTERNAL_RATIO" \
     MATCHED_RANDOM_SEED="$MATCHED_RANDOM_SEED" \
+    MATCHED_FIXED_METHOD="$MATCHED_FIXED_METHOD" \
+    MATCHED_RANDOM_METHOD="$MATCHED_RANDOM_METHOD" \
     DYNAMIC_MAX_INTERNAL_RUN="$DYNAMIC_MAX_INTERNAL_RUN" \
     DYNAMIC_ANCHOR_ACTION_GAP="$DYNAMIC_ANCHOR_ACTION_GAP" \
       bash "$0" matched
   done
-  for method in fixed65 random65; do
+  for method in "$MATCHED_FIXED_METHOD" "$MATCHED_RANDOM_METHOD"; do
     "$FASTWAM_PYTHON" scripts/summarize_dynamic_action_gap_cross_task.py \
       "$OUTPUT_ROOT" \
       --task-ids $CROSS_TASK_IDS \
@@ -319,6 +389,33 @@ run_cross_task_validation() {
     --task-ids $CROSS_TASK_IDS \
     --suites $CROSS_SUITES \
     --json-output "${OUTPUT_ROOT}/cross_task_summary.json"
+}
+
+run_default_validation() {
+  local suite
+  for suite in $CROSS_SUITES; do
+    run_fixed_eval "$suite"
+    run_dynamic_eval "$suite"
+  done
+}
+
+run_default_cross_task_validation() {
+  local task_id
+  for task_id in $CROSS_TASK_IDS; do
+    echo "=== Checkpoint-threshold cross validation: task ${task_id} ==="
+    TASK_ID="$task_id" \
+    NUM_TRIALS="$CROSS_NUM_TRIALS" \
+    CROSS_SUITES="$CROSS_SUITES" \
+    OUTPUT_ROOT="${OUTPUT_ROOT}/task${task_id}" \
+    GATE_CKPT="$GATE_CKPT" \
+      bash "$0" default-eval
+  done
+  "$FASTWAM_PYTHON" scripts/summarize_dynamic_action_gap_cross_task.py \
+    "$OUTPUT_ROOT" \
+    --task-ids $CROSS_TASK_IDS \
+    --suites $CROSS_SUITES \
+    --dynamic-method dynamic \
+    --json-output "${OUTPUT_ROOT}/cross_task_summary_default_threshold.json"
 }
 
 run_full_cross_task_validation() {
@@ -413,8 +510,20 @@ case "$STAGE" in
   matched-cross)
     run_compute_matched_cross_task_validation
     ;;
+  oracle)
+    run_oracle
+    ;;
+  oracle-cross)
+    run_oracle_cross_task_validation
+    ;;
   cross)
     run_cross_task_validation
+    ;;
+  default-eval)
+    run_default_validation
+    ;;
+  default-cross)
+    run_default_cross_task_validation
     ;;
   full-cross)
     run_full_cross_task_validation
@@ -445,7 +554,7 @@ case "$STAGE" in
       --json-output "${OUTPUT_ROOT}/comparison_summary.json"
     ;;
   *)
-    echo "Usage: $0 [full|collect|train|train-meta|eval|hybrid|v3|v4|candidate|candidate-cross|matched|matched-cross|validate|cross|full-cross|visualize|all]" >&2
+    echo "Usage: $0 [full|collect|train|train-meta|eval|default-eval|default-cross|hybrid|v3|v4|candidate|candidate-cross|matched|matched-cross|oracle|oracle-cross|validate|cross|full-cross|visualize|all]" >&2
     exit 2
     ;;
 esac
