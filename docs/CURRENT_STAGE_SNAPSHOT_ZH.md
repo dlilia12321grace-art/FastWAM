@@ -92,6 +92,21 @@ LingBot-VA、RoboTwin 2.0 和真机不是当前论文成立的前提。LingBot-V
 
 t0.40 与 random685 成功数相同，但 denoise/infer 分别约慢 `1.4%/0.7%`；相对 fixed685 多成功 1 次，但同样略慢。当前 MLP 没有改善 compute-matched 闭环 frontier。
 
+### VideoGap task0 smoke（Goal/Spatial，10 episodes/method）
+
+老师提出测试 Video DiT 的 gap 机制后，实现了跨 action/replanning chunks 的完整视觉缓存复用：刷新 chunk 计算图像编码、Video pre-DiT 和 Video KV prefill，缓存 chunk 复用最近一次 Video KV；缓存严格在 episode 边界清空。Action 侧固定为 `fork2_b0 + ActionGap=4`。
+
+| Method | Success | Image encode ms | Video pre ms | Video KV ms | Action ms | Infer ms | Refresh |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| VideoGap1 | **10/10** | 12.17 | 1.06 | 30.30 | 135.26 | 210.43 | 100.0% |
+| VideoGap2 | 6/10 | 5.31 | 0.55 | 15.48 | 137.44 | 189.27 | 50.4% |
+| VideoGap4 | 4/10 | 3.44 | 0.33 | 8.14 | 139.90 | **182.70** | 25.6% |
+
+- VideoGap2 相对 gap1 的 `infer_action` 加速为 `1.112x`，但成功数下降 4/10。
+- VideoGap4 的加速为 `1.152x`，但成功数下降 6/10。
+- 实测确认视觉缓存约有 11%--15% 的 wall-clock 潜力，但固定跨 chunk 复用造成严重 stale-visual 问题；当前静态 VideoGap 不可作为成功率保持方案，也不应直接扩大评测。
+- 若继续，应研究基于图像/latent变化、动作波动或接触阶段的动态刷新，而不是继续增加固定 gap。
+
 ## 5. 当前可写与不可写的结论
 
 ### 可以写
@@ -101,7 +116,8 @@ t0.40 与 random685 成功数相同，但 denoise/infer 分别约慢 `1.4%/0.7%`
 3. fork/block 存在明确的质量—延迟—参数权衡，离线 loss 与闭环成功率不完全一致。
 4. hidden+meta MLP 能准确预测 internal/full action gap，并产生从 quality-first 到 speed-first 的阈值前沿。
 5. t0.40 在 Goal/Spatial 的 180 episodes 上观察到与 fixed 相同成功数和约 10.6% `infer_action` 增量加速。
-6. LingBot-VA 已跑通 layer-2 direct head：60.8% internal timing smoke 中，internal step、Action DiT 和 infer wall 分别约为 `10.68x/2.27x/1.66x`；独立的 40% internal 小样本闭环对照与 full 均为 `9/10`。
+6. LingBot-VA 已跑通 layer-2 direct head：实际 39.2% internal 的 matched 30-episode pilot 获得约 `10.66x` internal-step、`1.53x` Action DiT 和 `1.31x` infer-wall 加速，成功率为 `27/30`（Full `29/30`），未见 trial2 子集两者均为 `9/10`；60.8% internal timing smoke 的 Action DiT/infer 加速进一步达到约 `2.27x/1.66x`。
+7. 固定 VideoGap 能按预期降低视觉计算并获得约 `1.11x--1.15x` `infer_action` 加速，但 task0 成功数从 `10/10` 降至 `6/10--4/10`，证明跨 chunk 视觉陈旧是实际瓶颈。
 
 ### 不能写
 
@@ -111,6 +127,7 @@ t0.40 与 random685 成功数相同，但 denoise/infer 分别约慢 `1.4%/0.7%`
 4. 不能把旧 fork4/v4 的 matched 负结果当成 fork2_b0 的最终 matched 结论。
 5. 不能声称已完成 LingBot 正式泛化、RoboTwin 或真机验证；LingBot 当前只有 timing smoke 和训练 trial 重叠的小样本闭环结果。
 6. 不能把 LingBot 的 60% timing 与 40% success 合并成同一配置的 speed-success 结论。
+7. 不能声称固定 VideoGap 可以保持成功率，或只根据速度结果将其写为有效方法。
 
 ## 6. 实验停止点
 
@@ -133,6 +150,7 @@ F:\codexprogramms\fastWAM\HANDOFF_FASTWAM.md
 /root/autodl-tmp/evaluate_results/internal_architecture_fork_screen
 /root/autodl-tmp/evaluate_results/internal_architecture_pareto
 /root/autodl-tmp/evaluate_results/dynamic_action_gap_fork2_b0
+/root/autodl-tmp/evaluate_results/video_gap_smoke
 ```
 
 关键 JSON：
@@ -145,6 +163,7 @@ dynamic_action_gap_fork2_b0/cross_task_summary_f2b0_t035.json
 dynamic_action_gap_fork2_b0/cross_task_summary_f2b0_t040.json
 dynamic_action_gap_fork2_b0/cross_task_summary_fixed685.json
 dynamic_action_gap_fork2_b0/cross_task_summary_random685.json
+video_gap_smoke/video_gap_summary.json
 ```
 
 ## 8. 文档阅读顺序

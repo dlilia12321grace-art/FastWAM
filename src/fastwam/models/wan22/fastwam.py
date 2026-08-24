@@ -23,6 +23,10 @@ from .internal_action_branch import (
     build_action_gap_schedule,
 )
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .video_gap import (
+    select_dynamic_video_cache_refresh,
+    should_refresh_video_cache,
+)
 
 logger = get_logger(__name__)
 
@@ -110,6 +114,7 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_action = float(loss_lambda_action)
         self.reset_c3cache_analysis()
         self.reset_c3cache_state()
+        self.reset_video_gap_state()
         self.reset_internal_distillation_samples()
         self._internal_action_heads = nn.ModuleDict()
         self._internal_action_heads_checkpoint: Optional[str] = None
@@ -138,6 +143,12 @@ class FastWAM(torch.nn.Module):
         """Clear C3ache residual cache at an episode boundary."""
         self._c3cache_residuals: dict[int, torch.Tensor] = {}
         self._c3cache_chunk_index = 0
+
+    def reset_video_gap_state(self) -> None:
+        """Clear cross-chunk Video DiT K/V at an episode boundary."""
+        self._video_gap_cache: Optional[dict[str, Any]] = None
+        self._video_gap_chunk_index = 0
+        self._video_gap_last_refresh_chunk: Optional[int] = None
 
     def reset_internal_distillation_samples(self) -> None:
         """Clear the in-memory Internal Head distillation sample buffer."""
@@ -1221,6 +1232,11 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         profile_timing: bool = False,
+        enable_video_gap_schedule: bool = False,
+        video_gap: int = 1,
+        enable_dynamic_video_gap: bool = False,
+        dynamic_video_gap_image_mse_threshold: float = 0.0,
+        dynamic_video_gap_max_cache_age: int = 1,
         analyze_c3cache_residuals: bool = False,
         enable_c3cache: bool = False,
         c3cache_start_step: int = 0,
@@ -1285,6 +1301,64 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
             )
+        if video_gap <= 0:
+            raise ValueError(f"`video_gap` must be positive, got {video_gap}.")
+        if enable_video_gap_schedule and enable_dynamic_video_gap:
+            raise ValueError(
+                "Fixed and dynamic VideoGap schedules are mutually exclusive."
+            )
+        if dynamic_video_gap_image_mse_threshold < 0:
+            raise ValueError(
+                "`dynamic_video_gap_image_mse_threshold` must be non-negative."
+            )
+        if dynamic_video_gap_max_cache_age <= 0:
+            raise ValueError(
+                "`dynamic_video_gap_max_cache_age` must be positive."
+            )
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+
+        video_gap_chunk_index = int(self._video_gap_chunk_index)
+        video_gap_enabled = enable_video_gap_schedule or enable_dynamic_video_gap
+        cached_video = self._video_gap_cache if video_gap_enabled else None
+        cache_matches_request = bool(
+            cached_video is not None
+            and int(cached_video["action_horizon"]) == int(action_horizon)
+            and tuple(cached_video["image_shape"]) == tuple(input_image.shape)
+        )
+        image_mse: Optional[float] = None
+        cache_age: Optional[int] = None
+        if cache_matches_request:
+            reference_image = cached_video["reference_image"]
+            image_mse = float(
+                (input_image.float() - reference_image.float())
+                .square()
+                .mean()
+                .item()
+            )
+            if self._video_gap_last_refresh_chunk is not None:
+                cache_age = (
+                    video_gap_chunk_index - self._video_gap_last_refresh_chunk
+                )
+
+        if enable_dynamic_video_gap:
+            refresh_video_cache, video_gap_reason = select_dynamic_video_cache_refresh(
+                cache_available=cache_matches_request,
+                image_mse=image_mse,
+                threshold=dynamic_video_gap_image_mse_threshold,
+                cache_age=cache_age,
+                max_cache_age=dynamic_video_gap_max_cache_age,
+            )
+        elif enable_video_gap_schedule:
+            refresh_video_cache = should_refresh_video_cache(
+                chunk_index=video_gap_chunk_index,
+                video_gap=video_gap,
+                cache_available=cache_matches_request,
+            )
+            video_gap_reason = "fixed_refresh" if refresh_video_cache else "fixed_reuse"
+        else:
+            refresh_video_cache = True
+            video_gap_reason = "disabled"
         if proprio is not None:
             if self.proprio_dim is None:
                 raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
@@ -1306,13 +1380,21 @@ class FastWAM(torch.nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        sync_for_timing()
-        image_encode_start = time.perf_counter()
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        sync_for_timing()
-        if profile_timing:
-            timing["image_encode_ms"] = (time.perf_counter() - image_encode_start) * 1000.0
+        first_frame_latents = None
+        if refresh_video_cache:
+            sync_for_timing()
+            image_encode_start = time.perf_counter()
+            first_frame_latents = self._encode_input_image_latents_tensor(
+                input_image=input_image,
+                tiled=tiled,
+            )
+            sync_for_timing()
+            if profile_timing:
+                timing["image_encode_ms"] = (
+                    time.perf_counter() - image_encode_start
+                ) * 1000.0
+        elif profile_timing:
+            timing["image_encode_ms"] = 0.0
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -1349,46 +1431,70 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
-        timestep_video = torch.zeros(
-            (first_frame_latents.shape[0],),
-            dtype=first_frame_latents.dtype,
-            device=self.device,
-        )
-        sync_for_timing()
-        video_pre_start = time.perf_counter()
-        video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=fuse_flag,
-        )
-        sync_for_timing()
-        if profile_timing:
-            timing["video_pre_dit_ms"] = (time.perf_counter() - video_pre_start) * 1000.0
-        video_seq_len = int(video_pre["tokens"].shape[1])
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_seq_len,
-            action_seq_len=latents_action.shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_pre["tokens"].device,
-        )
-        sync_for_timing()
-        video_prefill_start = time.perf_counter()
-        video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
-            },
-            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
-        )
-        sync_for_timing()
-        if profile_timing:
-            timing["video_kv_prefill_ms"] = (time.perf_counter() - video_prefill_start) * 1000.0
+        if refresh_video_cache:
+            assert first_frame_latents is not None
+            timestep_video = torch.zeros(
+                (first_frame_latents.shape[0],),
+                dtype=first_frame_latents.dtype,
+                device=self.device,
+            )
+            sync_for_timing()
+            video_pre_start = time.perf_counter()
+            video_pre = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+            sync_for_timing()
+            if profile_timing:
+                timing["video_pre_dit_ms"] = (
+                    time.perf_counter() - video_pre_start
+                ) * 1000.0
+            video_seq_len = int(video_pre["tokens"].shape[1])
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=latents_action.shape[1],
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                device=video_pre["tokens"].device,
+            )
+            sync_for_timing()
+            video_prefill_start = time.perf_counter()
+            video_kv_cache = self.mot.prefill_video_cache(
+                video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            )
+            sync_for_timing()
+            if profile_timing:
+                timing["video_kv_prefill_ms"] = (
+                    time.perf_counter() - video_prefill_start
+                ) * 1000.0
+            if video_gap_enabled:
+                self._video_gap_cache = {
+                    "video_kv_cache": video_kv_cache,
+                    "attention_mask": attention_mask,
+                    "video_seq_len": video_seq_len,
+                    "action_horizon": int(action_horizon),
+                    "image_shape": tuple(input_image.shape),
+                    "reference_image": input_image.detach().clone(),
+                }
+                self._video_gap_last_refresh_chunk = video_gap_chunk_index
+        else:
+            assert cached_video is not None
+            video_kv_cache = cached_video["video_kv_cache"]
+            attention_mask = cached_video["attention_mask"]
+            video_seq_len = int(cached_video["video_seq_len"])
+            if profile_timing:
+                timing["video_pre_dit_ms"] = 0.0
+                timing["video_kv_prefill_ms"] = 0.0
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -2039,6 +2145,32 @@ class FastWAM(torch.nn.Module):
         result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if video_gap_enabled:
+            last_refresh = self._video_gap_last_refresh_chunk
+            result["video_gap"] = {
+                "chunk_index": video_gap_chunk_index,
+                "mode": "dynamic_image_mse" if enable_dynamic_video_gap else "fixed",
+                "video_gap": int(video_gap),
+                "refresh_cache": bool(refresh_video_cache),
+                "reason": video_gap_reason,
+                "image_mse": image_mse,
+                "image_mse_threshold": (
+                    float(dynamic_video_gap_image_mse_threshold)
+                    if enable_dynamic_video_gap
+                    else None
+                ),
+                "max_cache_age": (
+                    int(dynamic_video_gap_max_cache_age)
+                    if enable_dynamic_video_gap
+                    else None
+                ),
+                "cache_age": (
+                    0
+                    if last_refresh is None
+                    else video_gap_chunk_index - int(last_refresh)
+                ),
+            }
+            self._video_gap_chunk_index += 1
         if analyze_c3cache_residuals:
             result["c3cache_residual_analysis"] = {
                 "chunk_index": self._c3cache_analysis_chunk_index,

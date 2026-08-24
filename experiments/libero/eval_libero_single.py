@@ -419,6 +419,19 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     if not visualize_future_video:
         infer_kwargs["profile_timing"] = profile_timing
+        infer_kwargs["enable_video_gap_schedule"] = bool(
+            cfg.EVALUATION.get("enable_video_gap_schedule", False)
+        )
+        infer_kwargs["video_gap"] = int(cfg.EVALUATION.get("video_gap", 1))
+        infer_kwargs["enable_dynamic_video_gap"] = bool(
+            cfg.EVALUATION.get("enable_dynamic_video_gap", False)
+        )
+        infer_kwargs["dynamic_video_gap_image_mse_threshold"] = float(
+            cfg.EVALUATION.get("dynamic_video_gap_image_mse_threshold", 0.0)
+        )
+        infer_kwargs["dynamic_video_gap_max_cache_age"] = int(
+            cfg.EVALUATION.get("dynamic_video_gap_max_cache_age", 1)
+        )
         infer_kwargs["analyze_c3cache_residuals"] = bool(
             cfg.EVALUATION.get("analyze_c3cache_residuals", False)
         )
@@ -567,6 +580,11 @@ def _predict_action_chunk(
         if chunk_metrics is None:
             chunk_metrics = {}
         chunk_metrics["c3cache"] = c3cache_metrics
+    video_gap_metrics = pred.get("video_gap")
+    if video_gap_metrics is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["video_gap"] = video_gap_metrics
     internal_layer_profile = pred.get("internal_layer_profile")
     if internal_layer_profile is not None:
         if chunk_metrics is None:
@@ -645,6 +663,13 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    if bool(cfg.EVALUATION.get("enable_video_gap_schedule", False)) or bool(
+        cfg.EVALUATION.get("enable_dynamic_video_gap", False)
+    ):
+        reset_video_gap = getattr(model, "reset_video_gap_state", None)
+        if reset_video_gap is None:
+            raise AttributeError("Model does not provide reset_video_gap_state().")
+        reset_video_gap()
     if bool(cfg.EVALUATION.get("enable_c3cache", False)):
         reset_cache = getattr(model, "reset_c3cache_state", None)
         if reset_cache is None:
@@ -1040,6 +1065,23 @@ def _run_single_task_with_env(
             )
             summary["c3cache_refresh_chunks"] = int(
                 sum(1 for chunk in c3cache_chunks if bool(chunk["refresh_cache"]))
+            )
+        video_gap_chunks = [
+            chunk["video_gap"]
+            for chunk in all_chunk_timings
+            if "video_gap" in chunk
+        ]
+        if video_gap_chunks:
+            refresh_chunks = sum(
+                1 for chunk in video_gap_chunks if bool(chunk["refresh_cache"])
+            )
+            summary["video_gap"] = int(video_gap_chunks[0]["video_gap"])
+            summary["video_gap_refresh_chunks"] = int(refresh_chunks)
+            summary["video_gap_reuse_chunks"] = int(
+                len(video_gap_chunks) - refresh_chunks
+            )
+            summary["video_gap_refresh_ratio"] = float(
+                refresh_chunks / len(video_gap_chunks)
             )
         results["timing_profile"]["summary"] = summary
     if save_action_trace:

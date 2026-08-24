@@ -29,6 +29,11 @@ EVALUATION:
   save_rollout_video: true
   save_action_trace: false
   profile_timing: false
+  enable_video_gap_schedule: false
+  video_gap: 1
+  enable_dynamic_video_gap: false
+  dynamic_video_gap_image_mse_threshold: 0.0
+  dynamic_video_gap_max_cache_age: 1
   analyze_c3cache_residuals: false
   enable_c3cache: false
   c3cache_start_step: 0

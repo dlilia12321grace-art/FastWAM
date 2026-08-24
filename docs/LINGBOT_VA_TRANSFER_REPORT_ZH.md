@@ -117,6 +117,39 @@ Action DiT 约占单次 `infer wall` 的 70%，因此是 early exit 的主要加
 
 当前仅能表述为：在这组 10-task smoke 中，没有观察到 aggregate success 下降。不能声称严格非劣，也不能将不同失败任务解释为确定的方法差异。
 
+### 5.3 Full 扩展到每任务 3 trial
+
+Full 随后运行 task0–9、每任务 trial0–2。该次完整调用的结果为 `29/30`，其中未参与 teacher collection 的 trial2 为 `9/10`，失败项为 task9 trial2。
+
+需要保留一个 runner 缺陷说明：旧版 `client.py` 将 `video_save_root_dict` 固定为 `None`，因此再次调用并不会真正 resume，而会从 trial0 开始重跑。task3 trial0 第一次为 False，后一次为 True，目录中因此同时存在两份视频，原始文件总数为 31。这里的 `29/30` 指后一次完整 30-episode 调用；历史全部实际执行为 `29/31`。该随机翻转也说明 10-episode 单次失败不能被过度解释。runner 已增加按 task/trial id 识别结果的续跑修复，后续正式配对应使用新输出目录和修复版本。
+
+### 5.4 t040 clean 30-episode 对照
+
+修复 runner 后，t040 使用全新目录运行 task0–9、每任务 trial0–2，共 30 个无重复 episode：
+
+| Method | Overall | Unseen trial2 |
+|---|---:|---:|
+| Full | 29/30 | 9/10 |
+| fork2_b0, target 40% internal | 27/30 | 9/10 |
+
+t040 的 30 个 episode 共记录 643 个 infer chunk；同任务分布的 Full 30-episode 日志包含 553 个 infer chunk。最终 matched timing 汇总如下：
+
+| Metric | Full | t040 | Speedup |
+|---|---:|---:|---:|
+| Success | 29/30 | 27/30 | — |
+| Actual internal ratio | 0% | 39.22% | — |
+| Full action step | — | 81.08 ms | — |
+| Internal action step | — | 7.60 ms | 10.66x（vs t040 full step） |
+| Video DiT | 1673.62 ms | 1705.27 ms | 0.981x |
+| Action DiT | 4071.26 ms | 2665.49 ms | **1.527x** |
+| Infer wall | 5796.82 ms | 4421.78 ms | **1.311x** |
+
+相对 Full，t040 将平均 Action DiT 和 infer wall 分别降低约 34.5% 和 23.7%。Video DiT 基本不变，符合 early exit 只修改 Action DiT 的预期。由于失败 episode 会产生更多 infer chunk，两种方法的 chunk 总数不同；表中 latency 是每个 infer chunk 的均值，而不是整段 rollout 总时长。
+
+t040 的三个失败为：task3 trial2、task4 trial1、task9 trial0。Full 后一次完整调用的失败为 task9 trial2。因此 30 个配对结果中：full-only=3、t040-only=1、both-fail=0、both-success=26；观察成功率差为 `-6.67 pp`，样本很小且 exact McNemar 双侧检验约为 `p=0.625`，不能声称显著退化或严格非劣。
+
+更重要的未见初始状态 trial2 上，两者均为 `9/10`：Full 失败 task9，t040 失败 task3，配对上各有一个独有成功。这一子集没有观察到 aggregate success 下降，但只有 10 episodes，只能作为 held-out pilot。
+
 ## 6. 证据边界
 
 ### 当前可以写
@@ -124,14 +157,14 @@ Action DiT 约占单次 `infer wall` 的 70%，因此是 early exit 的主要加
 1. LingBot-VA 的 Action DiT 是主要推理开销，约占 full infer wall 的 70%。
 2. fork2 direct head 在 RTX 5090 上将 internal step 从约 80.1 ms 降到约 7.5 ms。
 3. 在 60.8% internal ratio 的 timing smoke 中，Action DiT 和 infer wall 分别获得约 2.27x 和 1.66x 加速。
-4. 扩展 teacher 数据训练后，40% internal 在 task0 取得 5/5，并在 10-task smoke 中与 full 同为 9/10。
+4. 扩展 teacher 数据训练后，40% internal 在 task0 取得 5/5；30-episode pilot 为 27/30，对照 Full 为 29/30，而未见 trial2 子集两者均为 9/10。
 5. FastWAM 的“浅层 hidden 直接接 action head”机制可以迁移并运行于第二种 VLA/VA 实现。
 
 ### 当前不能写
 
 1. 不能声称 LingBot-VA 已完成正式泛化验证。
 2. 不能把 60% timing 与 40% success 拼成同一个配置的 speed-success 结果。
-3. 不能声称 40% 配置已有 1.66x infer 加速；其独立 timing 尚待汇总。
+3. 不能把 60% 配置的 1.66x infer 加速归给 40% 配置；t040 的独立结果为约 1.34x。
 4. 不能声称不掉点或统计非劣；当前每任务只有 1 个对照 trial。
 5. teacher collection 使用了 task0–9 的前两个 trial，当前 cross10 的 trial0 与训练数据重叠。
 6. 不能将 LingBot 结果与 FastWAM 的毫秒数直接横向比较；模型规模、实现和运行路径不同。
@@ -140,9 +173,9 @@ Action DiT 约占单次 `infer wall` 的 70%，因此是 early exit 的主要加
 
 ### P0：形成论文可用 LingBot 表格
 
-1. 独立汇总 t040 的 Action DiT、infer wall 和实际 internal ratio；
-2. 在未参与训练的 trial2–4 上做 Full/t040 相同初始状态配对；
-3. 至少报告 30 个未见 episode，或说明其为 pilot；
+1. 已完成同任务分布的 matched Full/t040 timing；若进入正式投稿扩展，再增加未见 trial3–4；
+2. 将未见配对从已完成的 trial2（10 episodes/method）扩展到 trial3–4；
+3. 至少达到 30 个未见 episode，当前 trial2 结果必须标为 pilot；
 4. 给成功率差异提供 paired disagreement 与置信区间。
 
 ### P1：完整 speed-success curve
@@ -169,4 +202,4 @@ Action DiT 约占单次 `infer wall` 的 70%，因此是 early exit 的主要加
 
 ## 9. 当前一句话结论
 
-> LingBot-VA 初步迁移验证表明，Action DiT layer-2 hidden 通过约 9.2 万参数的 direct head 可将 internal action step 加速约 10.7x；在 60.8% internal 的 timing smoke 中获得约 2.27x Action DiT 和 1.66x infer wall 加速，而更保守的 40% internal 在 10-task 小样本对照中与 full 同为 9/10。该结果支持方法具有跨实现迁移潜力，但正式未见 trial 配对评测仍待补充。
+> LingBot-VA 初步迁移验证表明，Action DiT layer-2 hidden 通过约 9.2 万参数的 direct head 可将 internal action step 加速约 10.7x。实际 39.2% internal 的 matched 30-episode pilot 获得约 1.53x Action DiT 和 1.31x infer wall 加速，成功率为 27/30（Full 29/30），而未见 trial2 子集两者均为 9/10；60.8% internal timing smoke 的对应加速进一步达到约 2.27x/1.66x。该结果支持方法具有跨实现迁移潜力，但尚未构成正式非劣性证明。

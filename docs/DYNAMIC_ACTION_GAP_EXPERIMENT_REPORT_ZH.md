@@ -530,6 +530,28 @@ t0.40 与 random685 成功数完全相同，但 denoise/infer 约慢 `1.4%/0.7%`
 
 至此最低实验闭环完成。论文正面主结果应是 fork2_b0 architecture：在四 Suite 上以约 49x 更少可训练参数和约 1.13x/1.09x 延迟改进保持或提高成功数观察值；MLP 部分应诚实报告为可形成 quality/speed threshold frontier，但未击败 compute-matched state-independent schedules。除非重新设计与控制风险更相关的 supervision，否则不继续扩大当前 gap-regression router。
 
+### 8.8.5 VideoGap：跨 action chunks 的视觉缓存复用
+
+为判断总推理中约 30 ms 的 Video DiT prefill 是否也能使用 gap 机制，实现了静态 VideoGap。第一个 action chunk 完整计算当前观测的图像编码、Video pre-DiT 和30层 Video KV prefill；后续 chunk 按固定 gap 周期刷新，其余 chunk 复用最近一次视觉 KV。缓存仅在同一 episode 内存在，并在 episode 边界、action horizon 或输入 shape 变化时强制失效。为隔离变量，Action 侧固定为已选定的 `fork2_b0 + ActionGap=4`。
+
+在 LIBERO Goal/Spatial task0 上，各方法运行5 episodes/Suite：
+
+| Method | Success | Image encode ms | Video pre ms | Video KV ms | Action denoise ms | Infer ms | Refresh ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| VideoGap1 | **10/10** | 12.17 | 1.06 | 30.30 | 135.26 | 210.43 | 100.0% |
+| VideoGap2 | 6/10 | 5.31 | 0.55 | 15.48 | 137.44 | 189.27 | 50.4% |
+| VideoGap4 | 4/10 | 3.44 | 0.33 | 8.14 | 139.90 | **182.70** | 25.6% |
+
+VideoGap2/4 相对 gap1 的 `infer_action` 加速分别为 `1.112x/1.152x`，说明视觉条件复用确实能够兑现 wall-clock 收益，而且 image encode、Video pre-DiT 和 Video KV 时间随刷新率近似下降。然而成功数分别下降至 `6/10` 和 `4/10`；gap4 的最后一个 Suite 仅为 `1/5`，多数失败轨迹运行到最大步数。该结果表明，机器人与物体状态在相邻 replanning chunks 间的变化不能被固定周期忽略，stale visual conditioning 会直接破坏闭环控制。
+
+因此，固定 VideoGap 当前是速度上界和失败诊断，不是可部署候选；不继续扩大相同配置。若后续研究 Video DiT 动态计算，应使用当前图像/latent变化量、动作波动、夹爪/接触阶段或最大 cache age 触发刷新，并与 gap1 做相同初始状态的配对比较。
+
+远端结果：
+
+```text
+/root/autodl-tmp/evaluate_results/video_gap_smoke/video_gap_summary.json
+```
+
 ## 9. 必须补充的实验
 
 ### P0：形成可信核心结论
