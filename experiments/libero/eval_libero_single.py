@@ -550,6 +550,15 @@ def _predict_action_chunk(
         infer_kwargs["collect_dynamic_action_gap_data"] = bool(
             cfg.EVALUATION.get("collect_dynamic_action_gap_data", False)
         )
+        infer_kwargs["enable_action_vde"] = bool(
+            cfg.EVALUATION.get("enable_action_vde", False)
+        )
+        infer_kwargs["action_vde_warmup_steps"] = int(
+            cfg.EVALUATION.get("action_vde_warmup_steps", 4)
+        )
+        infer_kwargs["action_vde_anchor_interval"] = int(
+            cfg.EVALUATION.get("action_vde_anchor_interval", 2)
+        )
 
     with torch.no_grad():
         if visualize_future_video:
@@ -615,6 +624,11 @@ def _predict_action_chunk(
         if chunk_metrics is None:
             chunk_metrics = {}
         chunk_metrics["dynamic_action_gap_collection"] = dynamic_action_gap_collection
+    action_vde = pred.get("action_vde")
+    if action_vde is not None:
+        if chunk_metrics is None:
+            chunk_metrics = {}
+        chunk_metrics["action_vde"] = action_vde
     return action, imgs, predicted_future_frames, chunk_metrics
 
 

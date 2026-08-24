@@ -16,6 +16,10 @@ from .dynamic_action_gap import (
     load_dynamic_action_gap_gate,
     select_dynamic_action_gap_route,
 )
+from .action_vde import (
+    ActionVelocityDecompositionEstimator,
+    build_action_vde_schedule,
+)
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .internal_action_branch import (
@@ -1275,6 +1279,9 @@ class FastWAM(torch.nn.Module):
         compute_matched_action_gap_target_internal_ratio: float = 0.65,
         compute_matched_action_gap_seed: int = 0,
         collect_dynamic_action_gap_data: bool = False,
+        enable_action_vde: bool = False,
+        action_vde_warmup_steps: int = 4,
+        action_vde_anchor_interval: int = 2,
     ) -> dict[str, Any]:
         timing: dict[str, Any] = {}
 
@@ -1524,6 +1531,35 @@ class FastWAM(torch.nn.Module):
         distillation_layers = tuple(
             sorted(set(int(layer) for layer in internal_distillation_layers))
         )
+        action_vde_schedule: Optional[list[str]] = None
+        action_vde_estimator: Optional[ActionVelocityDecompositionEstimator] = None
+        action_vde_step_modes: list[str] = []
+        action_vde_full_steps = 0
+        action_vde_estimate_steps = 0
+        action_vde_fallback_steps = 0
+        if enable_action_vde:
+            incompatible_action_acceleration = any((
+                enable_c3cache,
+                enable_internal_head,
+                enable_internal_lora_branch,
+                train_internal_lora,
+                enable_action_gap_schedule,
+                enable_dynamic_action_gap,
+                enable_oracle_action_gap,
+                collect_dynamic_action_gap_data,
+                compute_matched_action_gap_mode is not None,
+            ))
+            if incompatible_action_acceleration:
+                raise ValueError(
+                    "Action VDE smoke must run without C3ache, Internal Head, "
+                    "Internal LoRA, or ActionGap routing."
+                )
+            action_vde_schedule = build_action_vde_schedule(
+                len(infer_timesteps_action),
+                warmup_steps=int(action_vde_warmup_steps),
+                anchor_interval=int(action_vde_anchor_interval),
+            )
+            action_vde_estimator = ActionVelocityDecompositionEstimator()
         if collect_internal_distillation:
             invalid_layers = [
                 layer for layer in distillation_layers
@@ -1751,6 +1787,18 @@ class FastWAM(torch.nn.Module):
             denoise_step_start = time.perf_counter()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
+            action_vde_prediction = None
+            requested_vde_estimate = bool(
+                action_vde_schedule is not None
+                and action_vde_schedule[step_idx] == "estimate"
+            )
+            if requested_vde_estimate:
+                assert action_vde_estimator is not None
+                action_vde_prediction = action_vde_estimator.estimate(
+                    latents_action,
+                    timestep_action,
+                )
+
             step_in_cache_range = c3cache_start_step <= step_idx <= c3cache_end_step
             use_cached_residual = (
                 enable_c3cache
@@ -1771,7 +1819,11 @@ class FastWAM(torch.nn.Module):
                 internal_lora_step_modes.append(
                     "internal" if use_internal_lora else "full"
                 )
-            if enable_dynamic_action_gap:
+            if action_vde_prediction is not None:
+                pred_action_posi = action_vde_prediction
+                action_vde_step_modes.append("estimate")
+                action_vde_estimate_steps += 1
+            elif enable_dynamic_action_gap:
                 branch = self.internal_lora_branch
                 branch_input_layer = branch.fork_layer
                 _, intermediates = self._predict_action_noise_with_cache(
@@ -2134,6 +2186,19 @@ class FastWAM(torch.nn.Module):
                 if enable_c3cache:
                     c3cache_step_modes.append("full")
                     c3cache_full_steps += 1
+            if enable_action_vde and action_vde_prediction is None:
+                assert action_vde_estimator is not None
+                action_vde_estimator.add_anchor(
+                    latents_action,
+                    pred_action_posi,
+                    timestep_action,
+                )
+                if requested_vde_estimate:
+                    action_vde_step_modes.append("fallback_full")
+                    action_vde_fallback_steps += 1
+                else:
+                    action_vde_step_modes.append("full")
+                action_vde_full_steps += 1
             pred_action = pred_action_posi
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
@@ -2145,6 +2210,15 @@ class FastWAM(torch.nn.Module):
         result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if enable_action_vde:
+            result["action_vde"] = {
+                "warmup_steps": int(action_vde_warmup_steps),
+                "anchor_interval": int(action_vde_anchor_interval),
+                "step_modes": action_vde_step_modes,
+                "full_steps": int(action_vde_full_steps),
+                "estimate_steps": int(action_vde_estimate_steps),
+                "fallback_steps": int(action_vde_fallback_steps),
+            }
         if video_gap_enabled:
             last_refresh = self._video_gap_last_refresh_chunk
             result["video_gap"] = {

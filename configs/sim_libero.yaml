@@ -40,6 +40,11 @@ EVALUATION:
   c3cache_end_step: 6
   c3cache_refresh_interval: 4
 
+  # Training-free Action VDE (run alone for the first controlled experiment)
+  enable_action_vde: false
+  action_vde_warmup_steps: 4
+  action_vde_anchor_interval: 2
+
   # Internal LoRA / ActionGap inference
   enable_internal_lora_branch: false
   internal_lora_checkpoint: null
