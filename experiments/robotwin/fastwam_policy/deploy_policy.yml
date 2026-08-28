@@ -23,4 +23,7 @@ negative_prompt: ""
 rand_device: cpu
 tiled: false
 timing_enabled: false
+enable_action_vde: false
+action_vde_warmup_steps: 4
+action_vde_anchor_interval: 2
 skip_get_obs_within_replan: false

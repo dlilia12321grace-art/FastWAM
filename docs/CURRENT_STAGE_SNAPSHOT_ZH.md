@@ -1,6 +1,6 @@
 # FastWAM Internal Early Exit 当前阶段快照
 
-> 冻结日期：2026-08-19  
+> 更新日期：2026-08-29
 > 用途：论文写作、项目交接和后续实验的唯一当前入口。  
 > 状态：最低实验闭环已完成，停止新增实验并进入论文写作。历史 fork4/v4 结果仅用于说明研究演进，不代表当前最终方案。
 
@@ -12,7 +12,7 @@
 2. **When**：利用中间 hidden state 和轻量 MLP 判断当前 denoising step 走 internal 还是 full；
 3. **Evaluation**：闭环成功率、Action denoise、`infer_action`、参数量、训练成本、internal ratio 和控制稳定性。
 
-LingBot-VA、RoboTwin 2.0 和真机不是当前论文成立的前提。LingBot-VA 已完成初步迁移 smoke，可作为可选泛化证据；RoboTwin 2.0 由老师侧运行，真机仍属于未来扩展。
+LingBot-VA 和 RoboTwin 2.0 已完成 training-free VDE 的初步迁移验证，可作为泛化证据；真机仍属于未来扩展。它们不是当前论文主结果成立的前提。
 
 ## 2. 已完成工作
 
@@ -25,6 +25,8 @@ LingBot-VA、RoboTwin 2.0 和真机不是当前论文成立的前提。LingBot-V
 - fork2_b0 hidden+meta gate 重新采集、训练和 task1–9 阈值扫描；
 - 所有当前 runner 均支持显式 fork/source 配置；主要长评测支持结果级断点续跑；
 - 本地测试：`38 passed`。
+- FastWAM training-free Action VDE 已完成 LIBERO-10 cross30：Full `29/30`、VDE `30/30`，Action/`infer_action` mean 加速约 `1.40x/1.30x`，730 个 chunks 无 fallback；
+- RoboTwin 已跑通 Action VDE：`beat_block_hammer` 配对 3 seeds 两组均 `3/3`，另四个跨任务 smoke 两组均 `4/4`，VDE 路由稳定为 `7/3/0`。
 
 ## 3. 最终 static architecture 结果
 
@@ -118,6 +120,8 @@ t0.40 与 random685 成功数相同，但 denoise/infer 分别约慢 `1.4%/0.7%`
 5. t0.40 在 Goal/Spatial 的 180 episodes 上观察到与 fixed 相同成功数和约 10.6% `infer_action` 增量加速。
 6. LingBot-VA 已跑通 layer-2 direct head：实际 39.2% internal 的 matched 30-episode pilot 获得约 `10.66x` internal-step、`1.53x` Action DiT 和 `1.31x` infer-wall 加速，成功率为 `27/30`（Full `29/30`），未见 trial2 子集两者均为 `9/10`；60.8% internal timing smoke 的 Action DiT/infer 加速进一步达到约 `2.27x/1.66x`。
 7. 固定 VideoGap 能按预期降低视觉计算并获得约 `1.11x--1.15x` `infer_action` 加速，但 task0 成功数从 `10/10` 降至 `6/10--4/10`，证明跨 chunk 视觉陈旧是实际瓶颈。
+8. FastWAM Action VDE 在 LIBERO-10 cross30 中获得约 `1.40x` Action DiT 和 `1.30x` `infer_action` 加速，成功数为 VDE `30/30`、Full `29/30`，且无 fallback。
+9. RoboTwin 初步验证覆盖 5 个任务；现有配对样本均成功，Action 加速约落在 `1.3x--1.5x`，支持 VDE 跨评测链路迁移。
 
 ### 不能写
 
@@ -125,13 +129,13 @@ t0.40 与 random685 成功数相同，但 denoise/infer 分别约慢 `1.4%/0.7%`
 2. 不能声称 t0.40 的收益来自 learned importance；matched 结果显示它未优于 random685。
 3. 不能把相对 full 的全部收益归因于 MLP；主要收益来自 internal branch。
 4. 不能把旧 fork4/v4 的 matched 负结果当成 fork2_b0 的最终 matched 结论。
-5. 不能声称已完成 LingBot 正式泛化、RoboTwin 或真机验证；LingBot 当前只有 timing smoke 和训练 trial 重叠的小样本闭环结果。
+5. 不能声称已完成 LingBot 或 RoboTwin 的正式全 benchmark 泛化验证；现有结果均为 pilot，真机仍未验证。
 6. 不能把 LingBot 的 60% timing 与 40% success 合并成同一配置的 speed-success 结论。
 7. 不能声称固定 VideoGap 可以保持成功率，或只根据速度结果将其写为有效方法。
 
 ## 6. 实验停止点
 
-最低必需实验已经全部完成，当前没有必须继续的训练或测试。论文主线应以 fork2_b0 architecture Pareto 为正结果，以 MLP matched 负结果作为诊断和边界。LingBot-VA 初步迁移已完成但不阻塞写作；其未见 trial 配对、t0.35 matched、Object/LIBERO-10 dynamic、jitter、多 seed、RoboTwin/真机均为可选扩展。
+最低必需实验已经全部完成，当前没有必须继续扩大的 smoke。论文主线应以 fork2_b0 architecture Pareto 为正结果，以 MLP matched 负结果作为诊断和边界；Action VDE 的 FastWAM/LIBERO 与 RoboTwin pilot 作为 training-free 加速和跨环境泛化证据。后续优先写作，不再无目的扩大任务数。
 
 ## 7. 关键产物
 
@@ -171,5 +175,6 @@ video_gap_smoke/video_gap_summary.json
 1. 本快照；
 2. `DYNAMIC_ACTION_GAP_EXPERIMENT_REPORT_ZH.md`：完整实验演进与细节；
 3. `LINGBOT_VA_TRANSFER_REPORT_ZH.md`：LingBot-VA 迁移、timing、闭环 smoke 与证据边界；
-4. `HANDOFF_FASTWAM.md`：环境、代码、远端和历史操作；
-5. `paper/`：论文 Agent 维护的稿件，若与本快照数字冲突，以本快照和原始 JSON 为准。
+4. `ACTION_VDE_EXPERIMENT_PLAN_ZH.md`：FastWAM/LIBERO 与 RoboTwin 的 Action VDE 结果；
+5. `HANDOFF_FASTWAM.md`：环境、代码、远端和历史操作；
+6. `paper/`：论文 Agent 维护的稿件，若与本快照数字冲突，以本快照和原始 JSON 为准。

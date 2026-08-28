@@ -221,6 +221,15 @@ def main(cfg: DictConfig):
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    _append_override(overrides, "enable_action_vde", cfg.EVALUATION.enable_action_vde)
+    _append_override(
+        overrides, "action_vde_warmup_steps", cfg.EVALUATION.action_vde_warmup_steps
+    )
+    _append_override(
+        overrides,
+        "action_vde_anchor_interval",
+        cfg.EVALUATION.action_vde_anchor_interval,
+    )
     _append_override(
         overrides,
         "skip_get_obs_within_replan",

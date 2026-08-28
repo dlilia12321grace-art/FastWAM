@@ -154,6 +154,9 @@ class WorldActionRobotWinPolicy:
         rand_device: str,
         tiled: bool,
         timing_enabled: bool,
+        enable_action_vde: bool,
+        action_vde_warmup_steps: int,
+        action_vde_anchor_interval: int,
         num_video_frames: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
@@ -177,6 +180,9 @@ class WorldActionRobotWinPolicy:
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
+        self.enable_action_vde = bool(enable_action_vde)
+        self.action_vde_warmup_steps = int(action_vde_warmup_steps)
+        self.action_vde_anchor_interval = int(action_vde_anchor_interval)
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
@@ -251,6 +257,10 @@ class WorldActionRobotWinPolicy:
             "seed": self.seed,
             "rand_device": self.rand_device,
             "tiled": self.tiled,
+            "enable_action_vde": self.enable_action_vde,
+            "action_vde_warmup_steps": self.action_vde_warmup_steps,
+            "action_vde_anchor_interval": self.action_vde_anchor_interval,
+            "profile_timing": self.timing_enabled,
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
@@ -259,6 +269,23 @@ class WorldActionRobotWinPolicy:
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+
+        if self.enable_action_vde:
+            route = pred.get("action_vde", {})
+            logger.info(
+                "Action VDE route | full=%s estimate=%s fallback=%s modes=%s",
+                route.get("full_steps"),
+                route.get("estimate_steps"),
+                route.get("fallback_steps"),
+                route.get("step_modes"),
+            )
+        if self.timing_enabled and "timing" in pred:
+            timing = pred["timing"]
+            logger.info(
+                "FastWAM timing | action_denoise_ms=%.3f infer_action_ms=%.3f",
+                float(timing.get("action_denoise_total_ms", 0.0)),
+                float(timing.get("infer_action_total_ms", 0.0)),
+            )
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -368,6 +395,21 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    enable_action_vde = _parse_bool(
+        usr_args.get("enable_action_vde", cfg.EVALUATION.get("enable_action_vde", False))
+    )
+    action_vde_warmup_steps = int(
+        usr_args.get(
+            "action_vde_warmup_steps",
+            cfg.EVALUATION.get("action_vde_warmup_steps", 4),
+        )
+    )
+    action_vde_anchor_interval = int(
+        usr_args.get(
+            "action_vde_anchor_interval",
+            cfg.EVALUATION.get("action_vde_anchor_interval", 2),
+        )
+    )
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -386,6 +428,9 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         timing_enabled=timing_enabled,
+        enable_action_vde=enable_action_vde,
+        action_vde_warmup_steps=action_vde_warmup_steps,
+        action_vde_anchor_interval=action_vde_anchor_interval,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
     )
     return policy
