@@ -1,8 +1,8 @@
 # LingBot-VA Internal Early Exit 迁移实验记录
 
-> 更新日期：2026-08-19  
+> 更新日期：2026-08-29
 > 定位：FastWAM 论文的可选跨模型泛化实验，不替代 FastWAM 四 Suite 主结果。  
-> 当前状态：代码链路、teacher 蒸馏、固定比例 early exit、加速和小样本闭环 smoke 已跑通；正式未见 trial 配对评测尚未完成。
+> 当前状态：代码链路、teacher 蒸馏、固定比例 early exit、加速和小样本闭环 smoke 已跑通；Pure Dual-stream VDE 与 VDE+Internal 的 30 对 interleaved paired pilot 已完成。Internal-vs-Full 的正式未见 trial 扩展评测仍未完成。
 
 ## 1. 迁移目标与方法
 
@@ -150,6 +150,12 @@ t040 的三个失败为：task3 trial2、task4 trial1、task9 trial0。Full 后�
 
 更重要的未见初始状态 trial2 上，两者均为 `9/10`：Full 失败 task9，t040 失败 task3，配对上各有一个独有成功。这一子集没有观察到 aggregate success 下降，但只有 10 episodes，只能作为 held-out pilot。
 
+### 5.5 Pure Dual-stream VDE 与 VDE+Internal 严格配对验证
+
+在 LIBERO-10 task0–9、每任务 3 个固定 seed 上完成了 30 对、共 60 个 episode 的 interleaved paired 实验。Pure VDE 成功 `28/30`，VDE+Internal 成功 `29/30`；配对 outcome 为两者均成功 27 对、仅 Pure 成功 1 对、仅 Internal 成功 2 对、两者均失败 0 对。
+
+VDE+Internal 相比 Pure VDE 的 Action DiT 延迟平均降低 `84.87 ms（4.90%）`，`infer_action` 平均降低 `84.16 ms（2.95%）`。两组均无 fallback、路由异常或基础设施重跑；Pure VDE 的 Internal 调用严格为 0，组合方案实际调用 6061 个 Internal step。该结果支持 Internal 在 Pure VDE 基础上提供约 `3%–5%` 的额外推理收益，本次小样本中未观察到成功率下降；但尚不能声称统计显著或统计非劣。完整结果见 [`LINGBOT_PAIRED_VDE_INTERNAL_RESULT_ZH.md`](../../lingbot-va-upstream/docs/LINGBOT_PAIRED_VDE_INTERNAL_RESULT_ZH.md)。
+
 ## 6. 证据边界
 
 ### 当前可以写
@@ -159,24 +165,25 @@ t040 的三个失败为：task3 trial2、task4 trial1、task9 trial0。Full 后�
 3. 在 60.8% internal ratio 的 timing smoke 中，Action DiT 和 infer wall 分别获得约 2.27x 和 1.66x 加速。
 4. 扩展 teacher 数据训练后，40% internal 在 task0 取得 5/5；30-episode pilot 为 27/30，对照 Full 为 29/30，而未见 trial2 子集两者均为 9/10。
 5. FastWAM 的“浅层 hidden 直接接 action head”机制可以迁移并运行于第二种 VLA/VA 实现。
+6. 在 Pure Dual-stream VDE 与 VDE+Internal 的 30 对 interleaved paired pilot 中，组合方案成功 29/30（Pure VDE 为 28/30），并额外降低约 4.90% Action DiT 延迟和 2.95% `infer_action` 延迟；两组均未出现 fallback 或路由异常。
 
 ### 当前不能写
 
 1. 不能声称 LingBot-VA 已完成正式泛化验证。
 2. 不能把 60% timing 与 40% success 拼成同一个配置的 speed-success 结果。
-3. 不能把 60% 配置的 1.66x infer 加速归给 40% 配置；t040 的独立结果为约 1.34x。
-4. 不能声称不掉点或统计非劣；当前每任务只有 1 个对照 trial。
-5. teacher collection 使用了 task0–9 的前两个 trial，当前 cross10 的 trial0 与训练数据重叠。
+3. 不能把 60% 配置的 1.66x infer 加速归给 40% 配置；t040 的独立结果为约 1.31x。
+4. 不能把 29/30 与 28/30 表述为成功率提升，也不能声称 Internal 不掉点、统计显著或统计非劣；现有 Internal-vs-Full 和 VDE 组合实验均只有 30 个 paired pilot 样本。
+5. teacher collection 使用了 task0–9 的前两个 trial，当前 cross10 的 trial0 与训练数据重叠；现有 paired VDE 结果报告未证明其 seeds 与 teacher states 完全隔离，因此不得将该组结果描述为 unseen evaluation。
 6. 不能将 LingBot 结果与 FastWAM 的毫秒数直接横向比较；模型规模、实现和运行路径不同。
 
 ## 7. 待补实验（非当前立即必跑）
 
-### P0：形成论文可用 LingBot 表格
+### P0：增强论文中的跨模型证据
 
-1. 已完成同任务分布的 matched Full/t040 timing；若进入正式投稿扩展，再增加未见 trial3–4；
-2. 将未见配对从已完成的 trial2（10 episodes/method）扩展到 trial3–4；
-3. 至少达到 30 个未见 episode，当前 trial2 结果必须标为 pilot；
-4. 给成功率差异提供 paired disagreement 与置信区间。
+1. Internal-vs-Full 已完成同任务分布的 30-episode matched timing；若进入正式投稿，将未见配对从 trial2 扩展到 trial3–4，使未见子集达到 30 episodes/method；
+2. Pure VDE 与 VDE+Internal 的 30 对 interleaved paired pilot 已完成；若将其升级为主结果，再扩大固定 seed 数量；
+3. 对扩展实验报告 paired disagreement、成功率差置信区间和配对检验；在样本量与预设界限不足时仍不使用统计非劣表述；
+4. 当前 trial2、Internal-vs-Full 30-episode 结果以及 VDE 组合 30 对结果均应明确标为 pilot。
 
 ### P1：完整 speed-success curve
 
@@ -202,4 +209,4 @@ t040 的三个失败为：task3 trial2、task4 trial1、task9 trial0。Full 后�
 
 ## 9. 当前一句话结论
 
-> LingBot-VA 初步迁移验证表明，Action DiT layer-2 hidden 通过约 9.2 万参数的 direct head 可将 internal action step 加速约 10.7x。实际 39.2% internal 的 matched 30-episode pilot 获得约 1.53x Action DiT 和 1.31x infer wall 加速，成功率为 27/30（Full 29/30），而未见 trial2 子集两者均为 9/10；60.8% internal timing smoke 的对应加速进一步达到约 2.27x/1.66x。该结果支持方法具有跨实现迁移潜力，但尚未构成正式非劣性证明。
+> LingBot-VA 初步迁移验证表明，Action DiT layer-2 hidden 通过约 9.2 万参数的 direct head 可将 internal action step 加速约 10.7x。实际 39.2% internal 的 matched 30-episode pilot 获得约 1.53x Action DiT 和 1.31x infer wall 加速，成功率为 27/30（Full 29/30），而未见 trial2 子集两者均为 9/10；在另一组 30 对 interleaved pilot 中，VDE+Internal 相比 Pure Dual-stream VDE 额外降低约 4.90% Action DiT 和 2.95% `infer_action` 延迟，成功数为 29/30 与 28/30。结果支持 Internal 的跨实现迁移及其与 VDE 的可组合性，但尚未构成统计显著或正式非劣性证明。
